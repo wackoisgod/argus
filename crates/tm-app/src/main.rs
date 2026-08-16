@@ -1,3 +1,7 @@
+// GUI subsystem: no console window on launch. Startup tlog output still
+// reaches stderr when one is attached (e.g. `tm-app 2>log` from a shell).
+#![windows_subsystem = "windows"]
+
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
