@@ -53,6 +53,8 @@ struct ProcRow {
     exe_s: SharedString,
     icon: Option<std::sync::Arc<Vec<u8>>>,
     pid: u32,
+    parent: u32,
+    create: i64,
     pid_s: SharedString,
     user_s: SharedString,
     cpu: f32,
@@ -80,7 +82,13 @@ enum Row {
         collapsed: bool,
         apps: bool,
     },
-    Proc(ProcRow),
+    Proc {
+        row: ProcRow,
+        /// Indented child of an expanded app group.
+        child: bool,
+        /// For app-group roots: (expanded, descendant count).
+        group: Option<(bool, usize)>,
+    },
 }
 
 /// Aggregated totals shown on the second header line, Task Manager style.
@@ -112,6 +120,8 @@ struct ProcessTableDelegate {
     menu_row: Option<(u32, SharedString)>,
     collapsed_apps: bool,
     collapsed_bg: bool,
+    /// App-group roots (by pid) whose children are shown.
+    expanded: rustc_hash::FxHashSet<u32>,
 }
 
 impl ProcessTableDelegate {
@@ -143,6 +153,7 @@ impl ProcessTableDelegate {
             menu_row: None,
             collapsed_apps: false,
             collapsed_bg: false,
+            expanded: rustc_hash::FxHashSet::default(),
         }
     }
 
@@ -181,6 +192,8 @@ impl ProcessTableDelegate {
                 exe_s: exe.into(),
                 icon,
                 pid: p.raw.pid,
+                parent: p.raw.parent_pid,
+                create: p.raw.create_time,
                 pid_s: p.raw.pid.to_string().into(),
                 user_s: user.into(),
                 cpu: p.cpu_percent,
@@ -263,6 +276,31 @@ impl ProcessTableDelegate {
         self.rebuild_view();
     }
 
+    /// Nearest app-root ancestor for a process: itself if it owns a window,
+    /// otherwise the first windowed ancestor (parent links validated by
+    /// create-time ordering so a reused parent pid can't corrupt the tree).
+    fn app_root_of(
+        row: &ProcRow,
+        by_pid: &rustc_hash::FxHashMap<u32, (i64, u32, bool)>,
+    ) -> Option<u32> {
+        if row.has_window {
+            return Some(row.pid);
+        }
+        let (mut create, mut parent) = (row.create, row.parent);
+        for _ in 0..64 {
+            let &(p_create, p_parent, p_window) = by_pid.get(&parent)?;
+            if p_create > create {
+                return None; // parent pid was reused after we were born
+            }
+            if p_window {
+                return Some(parent);
+            }
+            create = p_create;
+            parent = p_parent;
+        }
+        None
+    }
+
     fn rebuild_view(&mut self) {
         let mut filtered: Vec<ProcRow> = self
             .all_rows
@@ -270,13 +308,75 @@ impl ProcessTableDelegate {
             .filter(|r| self.matches(r))
             .cloned()
             .collect();
-        self.sort_procs(&mut filtered);
-        // While filtering, show a flat list — sections just get in the way.
+        // While filtering, show a flat list — groups just get in the way.
         if !self.filter.is_empty() {
-            self.rows = filtered.into_iter().map(Row::Proc).collect();
+            self.sort_procs(&mut filtered);
+            self.rows = filtered
+                .into_iter()
+                .map(|row| Row::Proc {
+                    row,
+                    child: false,
+                    group: None,
+                })
+                .collect();
             return;
         }
-        let (apps, bg): (Vec<_>, Vec<_>) = filtered.into_iter().partition(|r| r.has_window);
+
+        let by_pid: rustc_hash::FxHashMap<u32, (i64, u32, bool)> = filtered
+            .iter()
+            .map(|r| (r.pid, (r.create, r.parent, r.has_window)))
+            .collect();
+        let mut groups: rustc_hash::FxHashMap<u32, Vec<ProcRow>> =
+            rustc_hash::FxHashMap::default();
+        let mut roots: Vec<ProcRow> = Vec::new();
+        let mut bg: Vec<ProcRow> = Vec::new();
+        for row in filtered {
+            match Self::app_root_of(&row, &by_pid) {
+                Some(root) if root == row.pid => roots.push(row),
+                Some(root) => groups.entry(root).or_default().push(row),
+                None => bg.push(row),
+            }
+        }
+
+        // Aggregate each root over its descendants.
+        let mut apps: Vec<(ProcRow, Vec<ProcRow>)> = roots
+            .into_iter()
+            .map(|root| {
+                let mut children = groups.remove(&root.pid).unwrap_or_default();
+                self.sort_procs(&mut children);
+                let mut agg = root.clone();
+                if !children.is_empty() {
+                    for c in &children {
+                        agg.cpu += c.cpu;
+                        agg.gpu += c.gpu;
+                        agg.mem += c.mem;
+                        agg.disk += c.disk;
+                        agg.net += c.net;
+                        agg.threads += c.threads;
+                        agg.handles += c.handles;
+                    }
+                    agg.cpu_s = format!("{:.1}%", agg.cpu).into();
+                    agg.gpu_s = format!("{:.1}%", agg.gpu).into();
+                    agg.mem_s = fmt_bytes(agg.mem).into();
+                    agg.disk_s = fmt_mibs(agg.disk).into();
+                    agg.net_s = fmt_mbps(agg.net).into();
+                    agg.threads_s = agg.threads.to_string().into();
+                    agg.handles_s = agg.handles.to_string().into();
+                    agg.pid_s = format!("{} +{}", agg.pid, children.len()).into();
+                    agg.name = format!("{} ({})", agg.name, children.len() + 1).into();
+                }
+                (agg, children)
+            })
+            .collect();
+        // Orphaned children whose root got filtered out (shouldn't happen
+        // without a filter, but stay safe) go to background.
+        for (_, mut orphans) in groups.drain() {
+            bg.append(&mut orphans);
+        }
+
+        apps.sort_by(|a, b| self.cmp_procs(&a.0, &b.0));
+        self.sort_procs(&mut bg);
+
         let mut rows = Vec::with_capacity(apps.len() + bg.len() + 2);
         rows.push(Row::Section {
             label: format!("Apps ({})", apps.len()).into(),
@@ -284,7 +384,26 @@ impl ProcessTableDelegate {
             apps: true,
         });
         if !self.collapsed_apps {
-            rows.extend(apps.into_iter().map(Row::Proc));
+            for (root, children) in apps {
+                let expanded = self.expanded.contains(&root.pid);
+                let count = children.len();
+                rows.push(Row::Proc {
+                    row: root,
+                    child: false,
+                    group: if count > 0 {
+                        Some((expanded, count))
+                    } else {
+                        None
+                    },
+                });
+                if expanded {
+                    rows.extend(children.into_iter().map(|row| Row::Proc {
+                        row,
+                        child: true,
+                        group: None,
+                    }));
+                }
+            }
         }
         rows.push(Row::Section {
             label: format!("Background processes ({})", bg.len()).into(),
@@ -292,15 +411,27 @@ impl ProcessTableDelegate {
             apps: false,
         });
         if !self.collapsed_bg {
-            rows.extend(bg.into_iter().map(Row::Proc));
+            rows.extend(bg.into_iter().map(|row| Row::Proc {
+                row,
+                child: false,
+                group: None,
+            }));
         }
         self.rows = rows;
     }
 
     fn sort_procs(&self, procs: &mut [ProcRow]) {
-        let Some((key, asc)) = &self.sort else { return };
+        if self.sort.is_some() {
+            procs.sort_by(|a, b| self.cmp_procs(a, b));
+        }
+    }
+
+    fn cmp_procs(&self, a: &ProcRow, b: &ProcRow) -> std::cmp::Ordering {
+        let Some((key, asc)) = &self.sort else {
+            return std::cmp::Ordering::Equal;
+        };
         let asc = *asc;
-        procs.sort_by(|a, b| {
+        {
             let ord = match key.as_ref() {
                 "name" => a
                     .name
@@ -331,7 +462,7 @@ impl ProcessTableDelegate {
             } else {
                 ord.reverse()
             }
-        });
+        }
     }
 }
 
@@ -379,18 +510,39 @@ impl TableDelegate for ProcessTableDelegate {
                     .child(format!("{chevron}  {label}"))
                     .into_any_element()
             }
-            Row::Proc(row) => {
-                let row = row.clone();
+            Row::Proc { row, child, group } => {
+                let (row, is_child, group) = (row.clone(), *child, *group);
                 match self.columns[col_ix].key.as_ref() {
                     "name" => {
                         let icon = row
                             .icon
                             .as_ref()
                             .map(|bytes| self.icon_image(row.pid, bytes));
+                        let root_pid = row.pid;
                         div()
                             .flex()
                             .items_center()
                             .gap(px(6.))
+                            .when(is_child, |d| d.pl(px(22.)))
+                            .child(match group {
+                                Some((expanded, _)) => div()
+                                    .id(("expand", row_ix))
+                                    .w(px(16.))
+                                    .flex_none()
+                                    .text_color(rgb(TEXT_DIM))
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(move |state, _, _, cx| {
+                                        let d = state.delegate_mut();
+                                        if !d.expanded.insert(root_pid) {
+                                            d.expanded.remove(&root_pid);
+                                        }
+                                        d.rebuild_view();
+                                        cx.notify();
+                                    }))
+                                    .child(if expanded { "▼" } else { "▶" })
+                                    .into_any_element(),
+                                None => div().w(px(16.)).flex_none().into_any_element(),
+                            })
                             .child(match icon {
                                 Some(image) => gpui::img(image)
                                     .w(px(16.))
@@ -490,7 +642,7 @@ impl TableDelegate for ProcessTableDelegate {
         _window: &mut Window,
         _cx: &mut Context<TableState<Self>>,
     ) -> PopupMenu {
-        let Some(Row::Proc(row)) = self.rows.get(row_ix) else {
+        let Some(Row::Proc { row, .. }) = self.rows.get(row_ix) else {
             return menu;
         };
         self.menu_row = Some((row.pid, row.name.clone()));
