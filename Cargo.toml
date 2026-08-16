@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = ["crates/tm-collector", "crates/tm-app"]
+
+[workspace.package]
+edition = "2021"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+# Debug info lands in the PDB (not the binary) on MSVC; keeping line tables
+# makes Superluminal captures attributable to real function names.
+debug = "line-tables-only"
+strip = "none"
+
+# GPUI is slow to compile unoptimized; keep deps optimized even in dev builds.
+[profile.dev.package."*"]
+opt-level = 2
+
+# Vendored gpui 0.2.2 with two Windows idle-efficiency patches in the vsync
+# thread (skip minimized windows; cap invalidation cadence at ~66Hz). See
+# vendor/gpui/src/platform/windows/platform.rs, search "TaskManager patch".
+[patch.crates-io]
+gpui = { path = "vendor/gpui" }
