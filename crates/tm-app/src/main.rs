@@ -88,10 +88,10 @@ enum Row {
     },
     Proc {
         row: ProcRow,
-        /// Indented child of an expanded app group.
+        /// Indented child of an expanded group.
         child: bool,
-        /// For app-group roots: (expanded, descendant count).
-        group: Option<(bool, usize)>,
+        /// For group rows: (expanded, member count, toggle key).
+        group: Option<(bool, usize, SharedString)>,
     },
 }
 
@@ -124,8 +124,8 @@ struct ProcessTableDelegate {
     menu_row: Option<(u32, SharedString)>,
     /// Collapse state for the Apps/Background/Windows sections.
     collapsed: [bool; 3],
-    /// App-group roots (by pid) whose children are shown.
-    expanded: rustc_hash::FxHashSet<u32>,
+    /// Group keys (app-root pid or section:name) whose members are shown.
+    expanded: rustc_hash::FxHashSet<String>,
 }
 
 impl ProcessTableDelegate {
@@ -294,6 +294,66 @@ impl ProcessTableDelegate {
                     .any(|c| row.exe_s.as_ref().eq_ignore_ascii_case(c)))
     }
 
+    /// Fold `others` into `base`: summed metrics, "(N)" name suffix and
+    /// "pid +K" pid display.
+    fn aggregate(base: ProcRow, others: &[ProcRow]) -> ProcRow {
+        let mut agg = base;
+        if others.is_empty() {
+            return agg;
+        }
+        for c in others {
+            agg.cpu += c.cpu;
+            agg.gpu += c.gpu;
+            agg.mem += c.mem;
+            agg.disk += c.disk;
+            agg.net += c.net;
+            agg.threads += c.threads;
+            agg.handles += c.handles;
+        }
+        agg.cpu_s = format!("{:.1}%", agg.cpu).into();
+        agg.gpu_s = format!("{:.1}%", agg.gpu).into();
+        agg.mem_s = fmt_bytes(agg.mem).into();
+        agg.disk_s = fmt_mibs(agg.disk).into();
+        agg.net_s = fmt_mbps(agg.net).into();
+        agg.threads_s = agg.threads.to_string().into();
+        agg.handles_s = agg.handles.to_string().into();
+        agg.pid_s = format!("{} +{}", agg.pid, others.len()).into();
+        agg.name = format!("{} ({})", agg.name, others.len() + 1).into();
+        agg
+    }
+
+    /// Group a flat section's rows by exe name: duplicates become one
+    /// aggregate row with the individuals as expandable members.
+    fn name_groups(
+        &self,
+        procs: Vec<ProcRow>,
+        section: u8,
+    ) -> Vec<(ProcRow, Vec<ProcRow>, Option<SharedString>)> {
+        let mut by_name: rustc_hash::FxHashMap<String, Vec<ProcRow>> =
+            rustc_hash::FxHashMap::default();
+        for row in procs {
+            by_name
+                .entry(row.exe_s.as_ref().to_ascii_lowercase())
+                .or_default()
+                .push(row);
+        }
+        let mut items: Vec<(ProcRow, Vec<ProcRow>, Option<SharedString>)> = by_name
+            .into_iter()
+            .map(|(name, mut members)| {
+                if members.len() == 1 {
+                    (members.pop().unwrap(), Vec::new(), None)
+                } else {
+                    self.sort_procs(&mut members);
+                    let display = Self::aggregate(members[0].clone(), &members[1..]);
+                    let key: SharedString = format!("{section}:{name}").into();
+                    (display, members, Some(key))
+                }
+            })
+            .collect();
+        items.sort_by(|a, b| self.cmp_procs(&a.0, &b.0));
+        items
+    }
+
     fn toggle_section(&mut self, id: u8) {
         self.collapsed[id as usize] = !self.collapsed[id as usize];
         self.rebuild_view();
@@ -369,27 +429,7 @@ impl ProcessTableDelegate {
             .map(|root| {
                 let mut children = groups.remove(&root.pid).unwrap_or_default();
                 self.sort_procs(&mut children);
-                let mut agg = root.clone();
-                if !children.is_empty() {
-                    for c in &children {
-                        agg.cpu += c.cpu;
-                        agg.gpu += c.gpu;
-                        agg.mem += c.mem;
-                        agg.disk += c.disk;
-                        agg.net += c.net;
-                        agg.threads += c.threads;
-                        agg.handles += c.handles;
-                    }
-                    agg.cpu_s = format!("{:.1}%", agg.cpu).into();
-                    agg.gpu_s = format!("{:.1}%", agg.gpu).into();
-                    agg.mem_s = fmt_bytes(agg.mem).into();
-                    agg.disk_s = fmt_mibs(agg.disk).into();
-                    agg.net_s = fmt_mbps(agg.net).into();
-                    agg.threads_s = agg.threads.to_string().into();
-                    agg.handles_s = agg.handles.to_string().into();
-                    agg.pid_s = format!("{} +{}", agg.pid, children.len()).into();
-                    agg.name = format!("{} ({})", agg.name, children.len() + 1).into();
-                }
+                let agg = Self::aggregate(root, &children);
                 (agg, children)
             })
             .collect();
@@ -400,52 +440,59 @@ impl ProcessTableDelegate {
         }
 
         apps.sort_by(|a, b| self.cmp_procs(&a.0, &b.0));
-        self.sort_procs(&mut bg);
-        self.sort_procs(&mut win);
+        let apps: Vec<(ProcRow, Vec<ProcRow>, Option<SharedString>)> = apps
+            .into_iter()
+            .map(|(root, children)| {
+                let key: Option<SharedString> = if children.is_empty() {
+                    None
+                } else {
+                    Some(root.pid.to_string().into())
+                };
+                (root, children, key)
+            })
+            .collect();
+        let bg_count = bg.len();
+        let win_count = win.len();
+        let bg = self.name_groups(bg, 1);
+        let win = self.name_groups(win, 2);
 
-        let mut rows = Vec::with_capacity(apps.len() + bg.len() + win.len() + 3);
-        rows.push(Row::Section {
-            label: format!("Apps ({})", apps.len()).into(),
-            collapsed: self.collapsed[0],
-            id: 0,
-        });
-        if !self.collapsed[0] {
-            for (root, children) in apps {
-                let expanded = self.expanded.contains(&root.pid);
-                let count = children.len();
-                rows.push(Row::Proc {
-                    row: root,
-                    child: false,
-                    group: if count > 0 {
-                        Some((expanded, count))
-                    } else {
-                        None
-                    },
-                });
-                if expanded {
-                    rows.extend(children.into_iter().map(|row| Row::Proc {
-                        row,
-                        child: true,
-                        group: None,
-                    }));
-                }
-            }
-        }
-        for (id, label, procs) in [
-            (1u8, "Background processes", bg),
-            (2u8, "Windows processes", win),
+        let mut rows = Vec::new();
+        for (id, label, count, items) in [
+            (0u8, "Apps", apps.len(), apps),
+            (1u8, "Background processes", bg_count, bg),
+            (2u8, "Windows processes", win_count, win),
         ] {
             rows.push(Row::Section {
-                label: format!("{label} ({})", procs.len()).into(),
+                label: format!("{label} ({count})").into(),
                 collapsed: self.collapsed[id as usize],
                 id,
             });
-            if !self.collapsed[id as usize] {
-                rows.extend(procs.into_iter().map(|row| Row::Proc {
-                    row,
-                    child: false,
-                    group: None,
-                }));
+            if self.collapsed[id as usize] {
+                continue;
+            }
+            for (display, members, key) in items {
+                match key {
+                    Some(key) => {
+                        let expanded = self.expanded.contains(key.as_ref());
+                        rows.push(Row::Proc {
+                            row: display,
+                            child: false,
+                            group: Some((expanded, members.len(), key)),
+                        });
+                        if expanded {
+                            rows.extend(members.into_iter().map(|row| Row::Proc {
+                                row,
+                                child: true,
+                                group: None,
+                            }));
+                        }
+                    }
+                    None => rows.push(Row::Proc {
+                        row: display,
+                        child: false,
+                        group: None,
+                    }),
+                }
             }
         }
         self.rows = rows;
@@ -542,21 +589,20 @@ impl TableDelegate for ProcessTableDelegate {
                     .into_any_element()
             }
             Row::Proc { row, child, group } => {
-                let (row, is_child, group) = (row.clone(), *child, *group);
+                let (row, is_child, group) = (row.clone(), *child, group.clone());
                 match self.columns[col_ix].key.as_ref() {
                     "name" => {
                         let icon = row
                             .icon
                             .as_ref()
                             .map(|bytes| self.icon_image(row.pid, bytes));
-                        let root_pid = row.pid;
                         div()
                             .flex()
                             .items_center()
                             .gap(px(6.))
                             .when(is_child, |d| d.pl(px(22.)))
                             .child(match group {
-                                Some((expanded, _)) => div()
+                                Some((expanded, _, key)) => div()
                                     .id(("expand", row_ix))
                                     .w(px(16.))
                                     .flex_none()
@@ -564,8 +610,9 @@ impl TableDelegate for ProcessTableDelegate {
                                     .cursor_pointer()
                                     .on_click(cx.listener(move |state, _, _, cx| {
                                         let d = state.delegate_mut();
-                                        if !d.expanded.insert(root_pid) {
-                                            d.expanded.remove(&root_pid);
+                                        let k = key.to_string();
+                                        if !d.expanded.insert(k.clone()) {
+                                            d.expanded.remove(&k);
                                         }
                                         d.rebuild_view();
                                         cx.notify();
