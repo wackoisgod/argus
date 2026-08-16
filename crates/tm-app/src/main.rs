@@ -85,8 +85,9 @@ struct ProcessTableDelegate {
     all_rows: Vec<ProcRow>,
     /// The visible view: sections + filtered, sorted processes.
     rows: Vec<Row>,
-    /// (column index, ascending); reapplied on every snapshot refresh.
-    sort: Option<(usize, bool)>,
+    /// (column key, ascending); keyed by name, not index, so column
+    /// drag-reordering can't desync sorting from data.
+    sort: Option<(SharedString, bool)>,
     /// Lowercased needle matched against name/user/description/PID.
     filter: String,
     /// Row the open context menu refers to: (pid, name).
@@ -117,7 +118,7 @@ impl ProcessTableDelegate {
             ],
             all_rows: Vec::new(),
             rows: Vec::new(),
-            sort: Some((1, true)), // PID, ascending
+            sort: Some(("pid".into(), true)),
             filter: String::new(),
             menu_row: None,
             collapsed_apps: false,
@@ -175,14 +176,19 @@ impl ProcessTableDelegate {
             || row.pid_s.as_ref().contains(&self.filter)
     }
 
+    fn is_text_column(key: &str) -> bool {
+        matches!(key, "name" | "user" | "desc")
+    }
+
     /// Text columns (name/user/description) sort ascending on first click;
     /// numeric columns descending, Task Manager style. Clicking the active
     /// column flips direction.
-    fn toggle_sort(&mut self, col: usize) {
-        let text_col = matches!(col, 0 | 2 | 10);
-        self.sort = match self.sort {
-            Some((c, asc)) if c == col => Some((col, !asc)),
-            _ => Some((col, text_col)),
+    fn toggle_sort(&mut self, col_ix: usize) {
+        let key = self.columns[col_ix].key.clone();
+        let text_col = Self::is_text_column(key.as_ref());
+        self.sort = match &self.sort {
+            Some((k, asc)) if *k == key => Some((key, !asc)),
+            _ => Some((key, text_col)),
         };
         self.rebuild_view();
     }
@@ -231,27 +237,28 @@ impl ProcessTableDelegate {
     }
 
     fn sort_procs(&self, procs: &mut [ProcRow]) {
-        let Some((col, asc)) = self.sort else { return };
+        let Some((key, asc)) = &self.sort else { return };
+        let asc = *asc;
         procs.sort_by(|a, b| {
-            let ord = match col {
-                0 => a
+            let ord = match key.as_ref() {
+                "name" => a
                     .name
                     .as_ref()
                     .to_ascii_lowercase()
                     .cmp(&b.name.as_ref().to_ascii_lowercase()),
-                1 => a.pid.cmp(&b.pid),
-                2 => a
+                "pid" => a.pid.cmp(&b.pid),
+                "user" => a
                     .user_s
                     .as_ref()
                     .to_ascii_lowercase()
                     .cmp(&b.user_s.as_ref().to_ascii_lowercase()),
-                3 => a.cpu.total_cmp(&b.cpu),
-                4 => a.gpu.total_cmp(&b.gpu),
-                5 => a.mem.cmp(&b.mem),
-                6 => a.disk.cmp(&b.disk),
-                7 => a.net.cmp(&b.net),
-                8 => a.threads.cmp(&b.threads),
-                9 => a.handles.cmp(&b.handles),
+                "cpu" => a.cpu.total_cmp(&b.cpu),
+                "gpu" => a.gpu.total_cmp(&b.gpu),
+                "mem" => a.mem.cmp(&b.mem),
+                "disk" => a.disk.cmp(&b.disk),
+                "net" => a.net.cmp(&b.net),
+                "threads" => a.threads.cmp(&b.threads),
+                "handles" => a.handles.cmp(&b.handles),
                 _ => a
                     .desc_s
                     .as_ref()
@@ -311,21 +318,34 @@ impl TableDelegate for ProcessTableDelegate {
                     .child(format!("{chevron}  {label}"))
                     .into_any_element()
             }
-            Row::Proc(row) => match col_ix {
-                0 => row.name.clone(),
-                1 => row.pid_s.clone(),
-                2 => row.user_s.clone(),
-                3 => row.cpu_s.clone(),
-                4 => row.gpu_s.clone(),
-                5 => row.mem_s.clone(),
-                6 => row.disk_s.clone(),
-                7 => row.net_s.clone(),
-                8 => row.threads_s.clone(),
-                9 => row.handles_s.clone(),
+            Row::Proc(row) => match self.columns[col_ix].key.as_ref() {
+                "name" => row.name.clone(),
+                "pid" => row.pid_s.clone(),
+                "user" => row.user_s.clone(),
+                "cpu" => row.cpu_s.clone(),
+                "gpu" => row.gpu_s.clone(),
+                "mem" => row.mem_s.clone(),
+                "disk" => row.disk_s.clone(),
+                "net" => row.net_s.clone(),
+                "threads" => row.threads_s.clone(),
+                "handles" => row.handles_s.clone(),
                 _ => row.desc_s.clone(),
             }
             .into_any_element(),
         }
+    }
+
+    fn move_column(
+        &mut self,
+        col_ix: usize,
+        to_ix: usize,
+        _window: &mut Window,
+        _cx: &mut Context<TableState<Self>>,
+    ) {
+        // Mirror the framework's col_groups reorder so key lookups stay
+        // aligned with visual positions.
+        let col = self.columns.remove(col_ix);
+        self.columns.insert(to_ix, col);
     }
 
     fn render_th(
@@ -335,9 +355,10 @@ impl TableDelegate for ProcessTableDelegate {
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         let name = self.columns[col_ix].name.clone();
-        let indicator = match self.sort {
-            Some((c, asc)) if c == col_ix => {
-                if asc {
+        let key = self.columns[col_ix].key.clone();
+        let indicator = match &self.sort {
+            Some((k, asc)) if *k == key => {
+                if *asc {
                     " ▲"
                 } else {
                     " ▼"
@@ -345,7 +366,7 @@ impl TableDelegate for ProcessTableDelegate {
             }
             _ => "",
         };
-        let right_aligned = !matches!(col_ix, 0 | 2 | 10);
+        let right_aligned = !Self::is_text_column(key.as_ref());
         div()
             .id(("proc-th", col_ix))
             .size_full()

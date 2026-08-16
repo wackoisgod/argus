@@ -92,10 +92,6 @@ impl GpuMonitor {
         }
     }
 
-    pub fn adapter_count(&self) -> usize {
-        self.adapters.len()
-    }
-
     /// Total cumulative GPU running time for one process, summed across all
     /// adapters and engine nodes. `None` if the process can't be opened.
     fn process_running_time(&self, pid: u32) -> Option<u64> {
