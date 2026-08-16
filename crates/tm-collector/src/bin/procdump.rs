@@ -21,9 +21,10 @@ fn main() {
         let cost = t0.elapsed();
         let s = &snap.system;
         println!(
-            "\n== tick {} [sample cost: {:?}] | CPU {:5.1}% | Mem {}/{} ({:.0}%) | {} procs, {} threads, {} handles ==",
+            "\n== tick {} [sample cost: {:?}] [etw: {}] | CPU {:5.1}% | Mem {}/{} ({:.0}%) | {} procs, {} threads, {} handles ==",
             tick + 1,
             cost,
+            if s.etw_active { "on" } else { "off" },
             s.cpu_percent,
             fmt_bytes(s.mem_used()),
             fmt_bytes(s.mem_total),
@@ -41,20 +42,20 @@ fn main() {
         procs.sort_by(|a, b| b.cpu_percent.total_cmp(&a.cpu_percent));
 
         println!(
-            "{:<28} {:>7} {:>6} {:>12} {:>12} {:>12} {:>7} {:>7}",
-            "Name", "PID", "CPU%", "WorkingSet", "Read/s", "Write/s", "Thrds", "Hndls"
+            "{:<28} {:>7} {:>6} {:>12} {:>12} {:>12} {:>12} {:>12}",
+            "Name", "PID", "CPU%", "WorkingSet", "Read/s", "Write/s", "Disk/s", "Net/s"
         );
         for p in procs.iter().take(15) {
             println!(
-                "{:<28} {:>7} {:>6.1} {:>12} {:>12} {:>12} {:>7} {:>7}",
+                "{:<28} {:>7} {:>6.1} {:>12} {:>12} {:>12} {:>12} {:>12}",
                 truncate(&p.raw.name, 28),
                 p.raw.pid,
                 p.cpu_percent,
                 fmt_bytes(p.raw.working_set),
                 fmt_bytes(p.read_bytes_per_sec),
                 fmt_bytes(p.write_bytes_per_sec),
-                p.raw.threads,
-                p.raw.handles,
+                fmt_bytes(p.disk_bytes_per_sec),
+                fmt_bytes(p.net_bytes_per_sec),
             );
         }
     }

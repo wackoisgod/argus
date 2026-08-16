@@ -45,10 +45,10 @@ struct ProcRow {
     cpu_s: SharedString,
     mem: u64,
     mem_s: SharedString,
-    read: u64,
-    read_s: SharedString,
-    write: u64,
-    write_s: SharedString,
+    disk: u64,
+    disk_s: SharedString,
+    net: u64,
+    net_s: SharedString,
     threads: u32,
     threads_s: SharedString,
     handles: u32,
@@ -78,8 +78,8 @@ impl ProcessTableDelegate {
                 Column::new("user", "User").width(px(110.)).sortable(),
                 Column::new("cpu", "CPU").width(px(80.)).text_right().sortable(),
                 Column::new("mem", "Memory").width(px(110.)).text_right().sortable(),
-                Column::new("read", "Read").width(px(110.)).text_right().sortable(),
-                Column::new("write", "Write").width(px(110.)).text_right().sortable(),
+                Column::new("disk", "Disk").width(px(110.)).text_right().sortable(),
+                Column::new("net", "Network").width(px(110.)).text_right().sortable(),
                 Column::new("threads", "Threads").width(px(80.)).text_right().sortable(),
                 Column::new("handles", "Handles").width(px(80.)).text_right().sortable(),
                 Column::new("desc", "Description").width(px(320.)).sortable(),
@@ -93,6 +93,7 @@ impl ProcessTableDelegate {
     }
 
     fn set_snapshot(&mut self, snap: &Snapshot) {
+        let etw = snap.system.etw_active;
         self.all_rows.clear();
         self.all_rows.reserve(snap.processes.len());
         for p in snap.processes.iter().filter(|p| p.raw.pid != 0) {
@@ -111,10 +112,29 @@ impl ProcessTableDelegate {
                 cpu_s: format!("{:.1}%", p.cpu_percent).into(),
                 mem: p.raw.private_working_set,
                 mem_s: fmt_bytes(p.raw.private_working_set).into(),
-                read: p.read_bytes_per_sec,
-                read_s: format!("{}/s", fmt_bytes(p.read_bytes_per_sec)).into(),
-                write: p.write_bytes_per_sec,
-                write_s: format!("{}/s", fmt_bytes(p.write_bytes_per_sec)).into(),
+                // Disk falls back to I/O transfer counters (an approximation
+                // that includes pipe/device I/O) when ETW is unavailable;
+                // network has no counter fallback.
+                disk: if etw {
+                    p.disk_bytes_per_sec
+                } else {
+                    p.read_bytes_per_sec + p.write_bytes_per_sec
+                },
+                disk_s: if etw {
+                    format!("{}/s", fmt_bytes(p.disk_bytes_per_sec)).into()
+                } else {
+                    format!(
+                        "{}/s*",
+                        fmt_bytes(p.read_bytes_per_sec + p.write_bytes_per_sec)
+                    )
+                    .into()
+                },
+                net: p.net_bytes_per_sec,
+                net_s: if etw {
+                    format!("{}/s", fmt_bytes(p.net_bytes_per_sec)).into()
+                } else {
+                    "—".into()
+                },
                 threads: p.raw.threads,
                 threads_s: p.raw.threads.to_string().into(),
                 handles: p.raw.handles,
@@ -166,8 +186,8 @@ impl ProcessTableDelegate {
                     .cmp(&b.user_s.as_ref().to_ascii_lowercase()),
                 3 => a.cpu.total_cmp(&b.cpu),
                 4 => a.mem.cmp(&b.mem),
-                5 => a.read.cmp(&b.read),
-                6 => a.write.cmp(&b.write),
+                5 => a.disk.cmp(&b.disk),
+                6 => a.net.cmp(&b.net),
                 7 => a.threads.cmp(&b.threads),
                 8 => a.handles.cmp(&b.handles),
                 _ => a
@@ -212,8 +232,8 @@ impl TableDelegate for ProcessTableDelegate {
             2 => row.user_s.clone(),
             3 => row.cpu_s.clone(),
             4 => row.mem_s.clone(),
-            5 => row.read_s.clone(),
-            6 => row.write_s.clone(),
+            5 => row.disk_s.clone(),
+            6 => row.net_s.clone(),
             7 => row.threads_s.clone(),
             8 => row.handles_s.clone(),
             _ => row.desc_s.clone(),
@@ -400,6 +420,11 @@ impl Render for TaskManagerApp {
             .child(div().w(px(340.)).child(Input::new(&self.filter_input)))
             .when_some(self.status.clone(), |this, status| {
                 this.child(div().text_color(rgb(TEXT_DIM)).child(status))
+            })
+            .when(self.first_snapshot && !self.sys.etw_active, |this| {
+                this.child(div().text_color(rgb(TEXT_DIM)).child(
+                    "* Disk approximated from I/O counters; run elevated for true disk & network",
+                ))
             });
 
         div()

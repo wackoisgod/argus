@@ -7,9 +7,11 @@
 //! per-process name strings.
 
 mod enrich;
+mod etw;
 mod nt;
 
 pub use enrich::{Enriched, Enricher};
+pub use etw::{EtwMonitor, IoTotals};
 pub use nt::RawProcess;
 
 use std::sync::Arc;
@@ -28,6 +30,10 @@ pub struct ProcessStats {
     pub cpu_percent: f32,
     pub read_bytes_per_sec: u64,
     pub write_bytes_per_sec: u64,
+    /// True disk bytes/sec from kernel ETW (0 when ETW is unavailable).
+    pub disk_bytes_per_sec: u64,
+    /// True network bytes/sec (TCP+UDP send+recv) from kernel ETW.
+    pub net_bytes_per_sec: u64,
     /// User + description, resolved asynchronously on the enrichment pool;
     /// `None` until the first resolution for this process completes.
     pub enriched: Option<Arc<Enriched>>,
@@ -42,6 +48,9 @@ pub struct SystemStats {
     pub thread_count: u32,
     pub handle_count: u32,
     pub logical_cpus: u32,
+    /// Whether the ETW session is running (needs elevation); when false the
+    /// disk/network per-process rates are unavailable.
+    pub etw_active: bool,
 }
 
 impl SystemStats {
@@ -68,11 +77,13 @@ struct PrevProc {
     cpu_100ns: i64,
     read_bytes: u64,
     write_bytes: u64,
+    etw: IoTotals,
 }
 
 pub struct Sampler {
     query: nt::ProcessQuery,
     enricher: Enricher,
+    etw: EtwMonitor,
     raw: Vec<RawProcess>,
     // Keyed by (pid, create_time) so a reused pid doesn't inherit deltas.
     prev: HashMap<(u32, i64), PrevProc>,
@@ -91,6 +102,7 @@ impl Sampler {
         Sampler {
             query: nt::ProcessQuery::new(),
             enricher: Enricher::new(),
+            etw: EtwMonitor::start(),
             raw: Vec::new(),
             prev: HashMap::new(),
             prev_idle: 0,
@@ -148,13 +160,16 @@ impl Sampler {
         let mut next_prev: HashMap<(u32, i64), PrevProc> =
             HashMap::with_capacity(self.raw.len());
         let mut processes = Vec::with_capacity(self.raw.len());
+        let etw_totals = self.etw.totals();
 
         for raw in &self.raw {
             thread_count += raw.threads;
             handle_count += raw.handles;
             let key = (raw.pid, raw.create_time);
             let cpu_100ns = raw.user_time_100ns + raw.kernel_time_100ns;
+            let etw = etw_totals.get(&raw.pid).copied().unwrap_or_default();
             let (mut cpu_pct, mut read_bps, mut write_bps) = (0.0f32, 0u64, 0u64);
+            let (mut disk_bps, mut net_bps) = (0u64, 0u64);
             if let Some(prev) = self.prev.get(&key) {
                 if d_total > 0 {
                     let d = (cpu_100ns - prev.cpu_100ns).max(0) as u64;
@@ -165,6 +180,12 @@ impl Sampler {
                         / elapsed) as u64;
                     write_bps = ((raw.write_bytes.saturating_sub(prev.write_bytes)) as f64
                         / elapsed) as u64;
+                    let d_disk = (etw.disk_read + etw.disk_write)
+                        .saturating_sub(prev.etw.disk_read + prev.etw.disk_write);
+                    let d_net = (etw.net_send + etw.net_recv)
+                        .saturating_sub(prev.etw.net_send + prev.etw.net_recv);
+                    disk_bps = (d_disk as f64 / elapsed) as u64;
+                    net_bps = (d_net as f64 / elapsed) as u64;
                 }
             }
             next_prev.insert(
@@ -173,6 +194,7 @@ impl Sampler {
                     cpu_100ns,
                     read_bytes: raw.read_bytes,
                     write_bytes: raw.write_bytes,
+                    etw,
                 },
             );
             processes.push(ProcessStats {
@@ -180,11 +202,16 @@ impl Sampler {
                 cpu_percent: cpu_pct,
                 read_bytes_per_sec: read_bps,
                 write_bytes_per_sec: write_bps,
+                disk_bytes_per_sec: disk_bps,
+                net_bytes_per_sec: net_bps,
                 enriched: self.enricher.get_or_schedule(key),
             });
         }
         self.prev = next_prev;
         self.enricher.retain(|k| self.prev.contains_key(k));
+        let live_pids: std::collections::HashSet<u32> =
+            self.raw.iter().map(|r| r.pid).collect();
+        self.etw.retain(|pid| live_pids.contains(&pid));
 
         Snapshot {
             system: SystemStats {
@@ -195,6 +222,7 @@ impl Sampler {
                 thread_count,
                 handle_count,
                 logical_cpus: self.logical_cpus,
+                etw_active: self.etw.active,
             },
             processes,
         }
