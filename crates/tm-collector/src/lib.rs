@@ -12,11 +12,13 @@ mod gpu;
 mod icon;
 mod net;
 mod nt;
+mod perf;
 mod windows_q;
 
 pub use enrich::{Enriched, Enricher};
 pub use etw::{EtwMonitor, IoTotals};
 pub use nt::RawProcess;
+pub use perf::{CoreLoad, MemDetail, NetAdapterStats, PerfInfo};
 
 use std::sync::Arc;
 
@@ -78,10 +80,13 @@ impl SystemStats {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct Snapshot {
     pub system: SystemStats,
     pub processes: Vec<ProcessStats>,
+    /// System-wide performance data; empty (`cores.is_empty()`) on light
+    /// ticks taken while the window is minimized.
+    pub perf: PerfInfo,
 }
 
 /// Per-process counters remembered from the previous tick.
@@ -99,6 +104,7 @@ pub struct Sampler {
     etw: EtwMonitor,
     gpu: gpu::GpuMonitor,
     conn: net::ConnQuery,
+    perf: perf::PerfSampler,
     raw: Vec<RawProcess>,
     // Keyed by (pid, create_time) so a reused pid doesn't inherit deltas.
     prev: FxHashMap<(u32, i64), PrevProc>,
@@ -120,6 +126,7 @@ impl Sampler {
             etw: EtwMonitor::start(),
             gpu: gpu::GpuMonitor::new(),
             conn: net::ConnQuery::new(),
+            perf: perf::PerfSampler::new(),
             raw: Vec::new(),
             prev: FxHashMap::default(),
             prev_idle: 0,
@@ -262,7 +269,15 @@ impl Sampler {
         let live_pids: FxHashSet<u32> = self.raw.iter().map(|r| r.pid).collect();
         self.etw.retain(|pid| live_pids.contains(&pid));
 
+        let perf = if light {
+            PerfInfo::default()
+        } else {
+            let gpus = self.gpu.adapter_utilization();
+            self.perf.sample(gpus)
+        };
+
         Snapshot {
+            perf,
             system: SystemStats {
                 cpu_percent,
                 mem_total: mem.ullTotalPhys,

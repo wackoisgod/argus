@@ -18,6 +18,8 @@ use gpui_component::theme::{Theme, ThemeMode};
 use gpui_component::Root;
 use tm_collector::{fmt_bytes, Sampler, Snapshot, SystemStats};
 
+mod perf_ui;
+
 actions!(tm, [EndTask, CopyPid, CopyName]);
 
 static START: OnceLock<Instant> = OnceLock::new();
@@ -740,6 +742,10 @@ struct TaskManagerApp {
     sys: SystemStats,
     status: Option<SharedString>,
     first_snapshot: bool,
+    /// 0 = Processes, 1 = Performance.
+    tab: u8,
+    pane: perf_ui::Pane,
+    history: perf_ui::PerfHistory,
 }
 
 /// True when our main window is minimized. The sampler thread discovers its
@@ -849,6 +855,7 @@ impl TaskManagerApp {
                         tlog("first snapshot applied");
                     }
                     this.sys = snap.system.clone();
+                    this.history.update(&snap);
                     this.table.update(cx, |state, cx| {
                         state.delegate_mut().set_snapshot(&snap);
                         cx.notify();
@@ -868,6 +875,9 @@ impl TaskManagerApp {
             sys: SystemStats::default(),
             status: None,
             first_snapshot: false,
+            tab: 0,
+            pane: perf_ui::Pane::Cpu,
+            history: perf_ui::PerfHistory::default(),
         }
     }
 
@@ -928,6 +938,57 @@ impl Render for TaskManagerApp {
                 this.child(div().text_color(rgb(TEXT_DIM)).child(status))
             });
 
+        let tab = |this: &Self,
+                   cx: &mut Context<Self>,
+                   id: u8,
+                   label: &'static str|
+         -> gpui::Stateful<gpui::Div> {
+            let active = this.tab == id;
+            div()
+                .id(("tab", id as usize))
+                .px(px(14.))
+                .py(px(6.))
+                .cursor_pointer()
+                .text_color(if active { rgb(TEXT) } else { rgb(TEXT_DIM) })
+                .border_b_2()
+                .border_color(if active {
+                    rgb(ACCENT)
+                } else {
+                    rgb(BG_HEADER)
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.tab = id;
+                    cx.notify();
+                }))
+                .child(label)
+        };
+        let tab_bar = div()
+            .flex()
+            .flex_none()
+            .gap(px(4.))
+            .px(px(8.))
+            .bg(rgb(BG_HEADER))
+            .child(tab(self, cx, 0, "Processes"))
+            .child(tab(self, cx, 1, "Performance"));
+
+        let body: gpui::AnyElement = if self.tab == 0 {
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .overflow_hidden()
+                .child(toolbar)
+                .child(
+                    div()
+                        .flex_1()
+                        .overflow_hidden()
+                        .child(Table::new(&self.table).stripe(true)),
+                )
+                .into_any_element()
+        } else {
+            self.render_performance(cx)
+        };
+
         div()
             .flex()
             .flex_col()
@@ -944,14 +1005,9 @@ impl Render for TaskManagerApp {
                     this.copy_to_clipboard(name.to_string(), cx);
                 }
             }))
+            .child(tab_bar)
             .child(stats_bar)
-            .child(toolbar)
-            .child(
-                div()
-                    .flex_1()
-                    .overflow_hidden()
-                    .child(Table::new(&self.table).stripe(true)),
-            )
+            .child(body)
     }
 }
 

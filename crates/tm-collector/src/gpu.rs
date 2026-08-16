@@ -26,6 +26,7 @@ extern "system" {
 }
 
 const TYPE_ADAPTER: u32 = 0;
+const TYPE_NODE: u32 = 5;
 const TYPE_PROCESS_NODE: u32 = 6;
 
 #[repr(C)]
@@ -76,6 +77,9 @@ pub struct GpuMonitor {
     prev: FxHashMap<(u32, i64), (u64, std::time::Instant)>,
     /// Pids that showed GPU time recently — polled every tick.
     active: FxHashSet<u32>,
+    /// Global per-(adapter, node) running time + timestamp, for adapter
+    /// utilization (busiest engine).
+    node_prev: Vec<Vec<(u64, std::time::Instant)>>,
     tick: u32,
 }
 
@@ -86,12 +90,50 @@ fn zeroed_stats() -> QueryStats {
 
 impl GpuMonitor {
     pub fn new() -> Self {
+        let adapters = enum_adapters();
+        let node_prev = adapters
+            .iter()
+            .map(|a| vec![(0u64, std::time::Instant::now()); a.node_count as usize])
+            .collect();
         GpuMonitor {
-            adapters: enum_adapters(),
+            adapters,
             prev: FxHashMap::default(),
             active: FxHashSet::default(),
+            node_prev,
             tick: 0,
         }
+    }
+
+    /// System-wide utilization per adapter: the busiest engine's percent,
+    /// Task Manager's definition of "GPU %".
+    pub fn adapter_utilization(&mut self) -> Vec<f32> {
+        let now = std::time::Instant::now();
+        let mut out = Vec::with_capacity(self.adapters.len());
+        for (ai, adapter) in self.adapters.iter().enumerate() {
+            let mut busiest = 0.0f32;
+            for node in 0..adapter.node_count {
+                let mut q = zeroed_stats();
+                q.ty = TYPE_NODE;
+                q.luid_low = adapter.luid_low;
+                q.luid_high = adapter.luid_high;
+                q.query_in[0] = node;
+                if unsafe { D3DKMTQueryStatistics(&mut q) } != 0 {
+                    continue;
+                }
+                let total = q.result[0]; // GlobalInformation.RunningTime
+                let (prev_total, prev_at) = self.node_prev[ai][node as usize];
+                let span = now.duration_since(prev_at).as_secs_f64();
+                if span > 0.05 && prev_total > 0 {
+                    let pct =
+                        (total.saturating_sub(prev_total) as f64 / (span * 10_000_000.0)
+                            * 100.0) as f32;
+                    busiest = busiest.max(pct.min(100.0));
+                }
+                self.node_prev[ai][node as usize] = (total, now);
+            }
+            out.push(busiest);
+        }
+        out
     }
 
     /// Total cumulative GPU running time for one process, summed across all
