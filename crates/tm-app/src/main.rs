@@ -62,7 +62,9 @@ struct ProcRow {
     gpu: f32,
     gpu_s: SharedString,
     has_window: bool,
-    is_windows: bool,
+    /// Image under %SystemRoot% (or pathless kernel process).
+    windows_dir: bool,
+    session: u32,
     mem: u64,
     mem_s: SharedString,
     disk: u64,
@@ -203,7 +205,8 @@ impl ProcessTableDelegate {
                 gpu: p.gpu_percent,
                 gpu_s: format!("{:.1}%", p.gpu_percent).into(),
                 has_window: p.has_window,
-                is_windows,
+                windows_dir: is_windows,
+                session: p.raw.session_id,
                 mem: p.raw.private_working_set,
                 mem_s: fmt_bytes(p.raw.private_working_set).into(),
                 disk: p.disk_bytes_per_sec,
@@ -270,6 +273,27 @@ impl ProcessTableDelegate {
         image
     }
 
+    /// "Windows processes" = OS core and services, not merely "lives in the
+    /// Windows folder": session-0 system processes plus the few core
+    /// session-bound components. Per-user helpers from the Windows dir
+    /// (RuntimeBroker, conhost, cmd, dllhost, ...) belong in Background,
+    /// matching Task Manager.
+    fn is_windows_section(row: &ProcRow) -> bool {
+        const CORE: [&str; 6] = [
+            "dwm.exe",
+            "csrss.exe",
+            "fontdrvhost.exe",
+            "winlogon.exe",
+            "smss.exe",
+            "LogonUI.exe",
+        ];
+        row.windows_dir
+            && (row.session == 0
+                || CORE
+                    .iter()
+                    .any(|c| row.exe_s.as_ref().eq_ignore_ascii_case(c)))
+    }
+
     fn toggle_section(&mut self, id: u8) {
         self.collapsed[id as usize] = !self.collapsed[id as usize];
         self.rebuild_view();
@@ -334,7 +358,7 @@ impl ProcessTableDelegate {
             match Self::app_root_of(&row, &by_pid) {
                 Some(root) if root == row.pid => roots.push(row),
                 Some(root) => groups.entry(root).or_default().push(row),
-                None if row.is_windows => win.push(row),
+                None if Self::is_windows_section(&row) => win.push(row),
                 None => bg.push(row),
             }
         }
