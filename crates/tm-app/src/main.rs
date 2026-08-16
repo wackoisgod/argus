@@ -676,6 +676,10 @@ fn main() {
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(gpui::TitlebarOptions {
+                    title: Some("Task Manager".into()),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
             move |window, cx| {

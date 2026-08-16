@@ -9,4 +9,13 @@ fn main() {
         println!("cargo:rustc-link-arg=/DELAYLOAD:{dll}");
     }
     println!("cargo:rustc-link-arg=delayimp.lib");
+
+    // Version resource so our own row shows a Description, like everyone
+    // else's processes do.
+    let mut res = winres::WindowsResource::new();
+    res.set("FileDescription", "Task Manager");
+    res.set("ProductName", "Task Manager");
+    if let Err(e) = res.compile() {
+        println!("cargo:warning=version resource skipped: {e}");
+    }
 }
