@@ -62,6 +62,7 @@ struct ProcRow {
     gpu: f32,
     gpu_s: SharedString,
     has_window: bool,
+    is_windows: bool,
     mem: u64,
     mem_s: SharedString,
     disk: u64,
@@ -80,7 +81,8 @@ enum Row {
     Section {
         label: SharedString,
         collapsed: bool,
-        apps: bool,
+        /// 0 = Apps, 1 = Background, 2 = Windows processes.
+        id: u8,
     },
     Proc {
         row: ProcRow,
@@ -118,8 +120,8 @@ struct ProcessTableDelegate {
     filter: String,
     /// Row the open context menu refers to: (pid, name).
     menu_row: Option<(u32, SharedString)>,
-    collapsed_apps: bool,
-    collapsed_bg: bool,
+    /// Collapse state for the Apps/Background/Windows sections.
+    collapsed: [bool; 3],
     /// App-group roots (by pid) whose children are shown.
     expanded: rustc_hash::FxHashSet<u32>,
 }
@@ -151,8 +153,7 @@ impl ProcessTableDelegate {
             sort: Some(("pid".into(), true)),
             filter: String::new(),
             menu_row: None,
-            collapsed_apps: false,
-            collapsed_bg: false,
+            collapsed: [false; 3],
             expanded: rustc_hash::FxHashSet::default(),
         }
     }
@@ -171,7 +172,7 @@ impl ProcessTableDelegate {
         self.all_rows.clear();
         self.all_rows.reserve(snap.processes.len());
         for p in snap.processes.iter().filter(|p| p.raw.pid != 0) {
-            let (user, desc, icon) = p
+            let (user, desc, icon, is_windows) = p
                 .enriched
                 .as_ref()
                 .map(|e| {
@@ -179,6 +180,7 @@ impl ProcessTableDelegate {
                         e.user.to_string(),
                         e.description.to_string(),
                         e.icon_png.clone(),
+                        e.windows_process,
                     )
                 })
                 .unwrap_or_default();
@@ -201,6 +203,7 @@ impl ProcessTableDelegate {
                 gpu: p.gpu_percent,
                 gpu_s: format!("{:.1}%", p.gpu_percent).into(),
                 has_window: p.has_window,
+                is_windows,
                 mem: p.raw.private_working_set,
                 mem_s: fmt_bytes(p.raw.private_working_set).into(),
                 disk: p.disk_bytes_per_sec,
@@ -267,12 +270,8 @@ impl ProcessTableDelegate {
         image
     }
 
-    fn toggle_section(&mut self, apps: bool) {
-        if apps {
-            self.collapsed_apps = !self.collapsed_apps;
-        } else {
-            self.collapsed_bg = !self.collapsed_bg;
-        }
+    fn toggle_section(&mut self, id: u8) {
+        self.collapsed[id as usize] = !self.collapsed[id as usize];
         self.rebuild_view();
     }
 
@@ -330,10 +329,12 @@ impl ProcessTableDelegate {
             rustc_hash::FxHashMap::default();
         let mut roots: Vec<ProcRow> = Vec::new();
         let mut bg: Vec<ProcRow> = Vec::new();
+        let mut win: Vec<ProcRow> = Vec::new();
         for row in filtered {
             match Self::app_root_of(&row, &by_pid) {
                 Some(root) if root == row.pid => roots.push(row),
                 Some(root) => groups.entry(root).or_default().push(row),
+                None if row.is_windows => win.push(row),
                 None => bg.push(row),
             }
         }
@@ -376,14 +377,15 @@ impl ProcessTableDelegate {
 
         apps.sort_by(|a, b| self.cmp_procs(&a.0, &b.0));
         self.sort_procs(&mut bg);
+        self.sort_procs(&mut win);
 
-        let mut rows = Vec::with_capacity(apps.len() + bg.len() + 2);
+        let mut rows = Vec::with_capacity(apps.len() + bg.len() + win.len() + 3);
         rows.push(Row::Section {
             label: format!("Apps ({})", apps.len()).into(),
-            collapsed: self.collapsed_apps,
-            apps: true,
+            collapsed: self.collapsed[0],
+            id: 0,
         });
-        if !self.collapsed_apps {
+        if !self.collapsed[0] {
             for (root, children) in apps {
                 let expanded = self.expanded.contains(&root.pid);
                 let count = children.len();
@@ -405,17 +407,22 @@ impl ProcessTableDelegate {
                 }
             }
         }
-        rows.push(Row::Section {
-            label: format!("Background processes ({})", bg.len()).into(),
-            collapsed: self.collapsed_bg,
-            apps: false,
-        });
-        if !self.collapsed_bg {
-            rows.extend(bg.into_iter().map(|row| Row::Proc {
-                row,
-                child: false,
-                group: None,
-            }));
+        for (id, label, procs) in [
+            (1u8, "Background processes", bg),
+            (2u8, "Windows processes", win),
+        ] {
+            rows.push(Row::Section {
+                label: format!("{label} ({})", procs.len()).into(),
+                collapsed: self.collapsed[id as usize],
+                id,
+            });
+            if !self.collapsed[id as usize] {
+                rows.extend(procs.into_iter().map(|row| Row::Proc {
+                    row,
+                    child: false,
+                    group: None,
+                }));
+            }
         }
         self.rows = rows;
     }
@@ -490,13 +497,13 @@ impl TableDelegate for ProcessTableDelegate {
             Row::Section {
                 label,
                 collapsed,
-                apps,
+                id,
             } => {
                 if col_ix != 0 {
                     return div().into_any_element();
                 }
                 let chevron = if *collapsed { "▶" } else { "▼" };
-                let apps_flag = *apps;
+                let section_id = *id;
                 div()
                     .id(("section", row_ix))
                     .flex()
@@ -504,7 +511,7 @@ impl TableDelegate for ProcessTableDelegate {
                     .text_color(rgb(ACCENT))
                     .cursor_pointer()
                     .on_click(cx.listener(move |state, _, _, cx| {
-                        state.delegate_mut().toggle_section(apps_flag);
+                        state.delegate_mut().toggle_section(section_id);
                         cx.notify();
                     }))
                     .child(format!("{chevron}  {label}"))

@@ -31,6 +31,9 @@ pub struct Enriched {
     pub description: Arc<str>,
     /// The exe's shell icon, PNG-encoded.
     pub icon_png: Option<Arc<Vec<u8>>>,
+    /// Image lives under %SystemRoot% (or is a pathless kernel process) —
+    /// Task Manager's "Windows processes" test.
+    pub windows_process: bool,
 }
 
 type Key = (u32, i64); // (pid, create_time) — stable across pid reuse
@@ -145,11 +148,41 @@ fn resolve(pid: u32, wts: &Mutex<WtsUsers>) -> Enriched {
             user = u;
         }
     }
+    let windows_process = match &exe_path {
+        Some(path) => in_windows_dir(path),
+        // No image path at all = kernel pseudo-process (System, Registry,
+        // Secure System, Memory Compression).
+        None => true,
+    };
     Enriched {
         user,
         description,
         icon_png,
+        windows_process,
     }
+}
+
+fn in_windows_dir(path: &[u16]) -> bool {
+    use std::sync::OnceLock;
+    static WINDIR: OnceLock<Vec<u16>> = OnceLock::new();
+    fn lower(c: u16) -> u16 {
+        if (b'A' as u16..=b'Z' as u16).contains(&c) {
+            c + 32
+        } else {
+            c
+        }
+    }
+    let windir = WINDIR.get_or_init(|| {
+        let dir = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
+        let mut w: Vec<u16> = dir.encode_utf16().map(lower).collect();
+        w.push(b'\\' as u16);
+        w
+    });
+    path.len() > windir.len()
+        && path[..windir.len()]
+            .iter()
+            .zip(windir.iter())
+            .all(|(a, b)| lower(*a) == *b)
 }
 
 /// Translate "\Device\HarddiskVolumeN\..." to "C:\..." using the dos-device
