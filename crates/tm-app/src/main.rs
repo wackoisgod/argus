@@ -804,8 +804,10 @@ fn spawn_sampler() -> futures::channel::mpsc::Receiver<Snapshot> {
                     }
                 }
                 // try_send: if the UI is behind, drop this tick rather than
-                // block the sampler.
-                match tx.try_send(sampler.sample()) {
+                // block the sampler. Minimized ticks skip the GPU probe and
+                // connection walk nobody can see.
+                let still_minimized = minimized && window_minimized(&mut hwnd);
+                match tx.try_send(sampler.sample_with(still_minimized)) {
                     Err(e) if e.is_disconnected() => break,
                     _ => {}
                 }

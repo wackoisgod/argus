@@ -70,8 +70,10 @@ struct Adapter {
 
 pub struct GpuMonitor {
     adapters: Vec<Adapter>,
-    /// Cumulative running time (100ns units) per (pid, create_time).
-    prev: FxHashMap<(u32, i64), u64>,
+    /// Cumulative running time (100ns units) and probe timestamp per
+    /// (pid, create_time). Deltas divide by the span since *that process's*
+    /// last probe — bucket-cadence probes cover many ticks.
+    prev: FxHashMap<(u32, i64), (u64, std::time::Instant)>,
     /// Pids that showed GPU time recently — polled every tick.
     active: FxHashSet<u32>,
     tick: u32,
@@ -121,14 +123,11 @@ impl GpuMonitor {
 
     /// Per-pid GPU percent (of one GPU engine, all cores=100 like CPU) for
     /// this tick. Call once per sampler tick.
-    pub fn sample(
-        &mut self,
-        procs: &[crate::RawProcess],
-        elapsed: f64,
-    ) -> FxHashMap<u32, f32> {
+    pub fn sample(&mut self, procs: &[crate::RawProcess]) -> FxHashMap<u32, f32> {
         self.tick = self.tick.wrapping_add(1);
+        let now = std::time::Instant::now();
         let mut out = FxHashMap::default();
-        if self.adapters.is_empty() || elapsed <= 0.05 {
+        if self.adapters.is_empty() {
             return out;
         }
         let mut next_prev = FxHashMap::default();
@@ -142,8 +141,8 @@ impl GpuMonitor {
                 || !known
                 || (raw.pid / 4) % 10 == self.tick % 10;
             if !probe {
-                // Carry the stale total forward so the next real probe
-                // computes its delta over the right baseline.
+                // Carry the stale total (and its timestamp) forward so the
+                // next real probe computes its rate over the right span.
                 if let Some(prev) = self.prev.get(&key) {
                     next_prev.insert(key, *prev);
                 }
@@ -152,23 +151,26 @@ impl GpuMonitor {
             let Some(total) = self.process_running_time(raw.pid) else {
                 continue;
             };
-            if let Some(prev) = self.prev.get(&key) {
-                let delta = total.saturating_sub(*prev);
-                // RunningTime is in 100ns units (per System Informer, despite
-                // the header comment claiming microseconds).
-                let pct = (delta as f64 / (elapsed * 10_000_000.0) * 100.0) as f32;
-                if pct > 0.05 {
-                    out.insert(raw.pid, pct);
-                }
-                if delta > 0 {
-                    self.active.insert(raw.pid);
-                } else {
-                    self.active.remove(&raw.pid);
+            if let Some((prev_total, prev_at)) = self.prev.get(&key) {
+                let span = now.duration_since(*prev_at).as_secs_f64();
+                if span > 0.05 {
+                    let delta = total.saturating_sub(*prev_total);
+                    // RunningTime is in 100ns units (per System Informer,
+                    // despite the header comment claiming microseconds).
+                    let pct = (delta as f64 / (span * 10_000_000.0) * 100.0) as f32;
+                    if pct > 0.05 {
+                        out.insert(raw.pid, pct);
+                    }
+                    if delta > 0 {
+                        self.active.insert(raw.pid);
+                    } else {
+                        self.active.remove(&raw.pid);
+                    }
                 }
             } else if total > 0 {
                 self.active.insert(raw.pid);
             }
-            next_prev.insert(key, total);
+            next_prev.insert(key, (total, now));
         }
         self.prev = next_prev;
         out

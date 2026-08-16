@@ -134,6 +134,14 @@ impl Sampler {
     /// Take a snapshot. The first call has no baseline, so all rates are 0;
     /// call once at startup and then on every tick.
     pub fn sample(&mut self) -> Snapshot {
+        self.sample_with(false)
+    }
+
+    /// `light` skips the optional per-process extras (GPU probing, the
+    /// connection-table walk) — for ticks taken while the window is
+    /// minimized, where nobody sees those columns. Rate math stays correct
+    /// across the gap because GPU deltas carry their own timestamps.
+    pub fn sample_with(&mut self, light: bool) -> Snapshot {
         let now = Instant::now();
         let elapsed = self
             .prev_tick
@@ -178,11 +186,15 @@ impl Sampler {
             FxHashMap::with_capacity_and_hasher(self.raw.len(), Default::default());
         let mut processes = Vec::with_capacity(self.raw.len());
         let etw_totals = self.etw.totals();
-        let gpu_pcts = self.gpu.sample(&self.raw, elapsed);
+        let gpu_pcts = if light {
+            FxHashMap::default()
+        } else {
+            self.gpu.sample(&self.raw)
+        };
         let window_pids = windows_q::pids_with_visible_windows();
         // Without ETW, network is approximated from AFD-ioctl counters;
         // only processes actually owning sockets get attributed.
-        let conn_pids = if self.etw.active {
+        let conn_pids = if self.etw.active || light {
             FxHashSet::default()
         } else {
             self.conn.pids_with_connections()
