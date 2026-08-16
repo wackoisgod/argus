@@ -8,8 +8,10 @@
 
 mod enrich;
 mod etw;
+mod gpu;
 mod net;
 mod nt;
+mod windows_q;
 
 pub use enrich::{Enriched, Enricher};
 pub use etw::{EtwMonitor, IoTotals};
@@ -30,6 +32,8 @@ pub struct ProcessStats {
     pub raw: RawProcess,
     /// Percent of total system CPU (all cores = 100).
     pub cpu_percent: f32,
+    /// GPU engine utilization percent across all adapters/nodes.
+    pub gpu_percent: f32,
     pub read_bytes_per_sec: u64,
     pub write_bytes_per_sec: u64,
     /// Disk bytes/sec. Kernel-ETW truth when the session is available,
@@ -42,6 +46,8 @@ pub struct ProcessStats {
     /// User + description, resolved asynchronously on the enrichment pool;
     /// `None` until the first resolution for this process completes.
     pub enriched: Option<Arc<Enriched>>,
+    /// Owns a visible, titled top-level window (Task Manager's "Apps" test).
+    pub has_window: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -90,6 +96,7 @@ pub struct Sampler {
     query: nt::ProcessQuery,
     enricher: Enricher,
     etw: EtwMonitor,
+    gpu: gpu::GpuMonitor,
     conn: net::ConnQuery,
     raw: Vec<RawProcess>,
     // Keyed by (pid, create_time) so a reused pid doesn't inherit deltas.
@@ -110,6 +117,7 @@ impl Sampler {
             query: nt::ProcessQuery::new(),
             enricher: Enricher::new(),
             etw: EtwMonitor::start(),
+            gpu: gpu::GpuMonitor::new(),
             conn: net::ConnQuery::new(),
             raw: Vec::new(),
             prev: FxHashMap::default(),
@@ -169,6 +177,8 @@ impl Sampler {
             FxHashMap::with_capacity_and_hasher(self.raw.len(), Default::default());
         let mut processes = Vec::with_capacity(self.raw.len());
         let etw_totals = self.etw.totals();
+        let gpu_pcts = self.gpu.sample(&self.raw, elapsed);
+        let window_pids = windows_q::pids_with_visible_windows();
         // Without ETW, network is approximated from AFD-ioctl counters;
         // only processes actually owning sockets get attributed.
         let conn_pids = if self.etw.active {
@@ -225,11 +235,13 @@ impl Sampler {
             processes.push(ProcessStats {
                 raw: raw.clone(),
                 cpu_percent: cpu_pct,
+                gpu_percent: gpu_pcts.get(&raw.pid).copied().unwrap_or(0.0),
                 read_bytes_per_sec: read_bps,
                 write_bytes_per_sec: write_bps,
                 disk_bytes_per_sec: disk_bps,
                 net_bytes_per_sec: net_bps,
                 enriched: self.enricher.get_or_schedule(key),
+                has_window: window_pids.contains(&raw.pid),
             });
         }
         self.prev = next_prev;

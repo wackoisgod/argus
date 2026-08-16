@@ -53,6 +53,9 @@ struct ProcRow {
     desc_s: SharedString,
     cpu: f32,
     cpu_s: SharedString,
+    gpu: f32,
+    gpu_s: SharedString,
+    has_window: bool,
     mem: u64,
     mem_s: SharedString,
     disk: u64,
@@ -65,18 +68,31 @@ struct ProcRow {
     handles_s: SharedString,
 }
 
+/// A visible table row: either a collapsible section header or a process.
+#[derive(Clone)]
+enum Row {
+    Section {
+        label: SharedString,
+        collapsed: bool,
+        apps: bool,
+    },
+    Proc(ProcRow),
+}
+
 struct ProcessTableDelegate {
     columns: Vec<Column>,
     /// Every process from the latest snapshot, unfiltered and unsorted.
     all_rows: Vec<ProcRow>,
-    /// The visible view: filtered by `filter`, ordered by `sort`.
-    rows: Vec<ProcRow>,
+    /// The visible view: sections + filtered, sorted processes.
+    rows: Vec<Row>,
     /// (column index, ascending); reapplied on every snapshot refresh.
     sort: Option<(usize, bool)>,
     /// Lowercased needle matched against name/user/description/PID.
     filter: String,
     /// Row the open context menu refers to: (pid, name).
     menu_row: Option<(u32, SharedString)>,
+    collapsed_apps: bool,
+    collapsed_bg: bool,
 }
 
 impl ProcessTableDelegate {
@@ -91,6 +107,7 @@ impl ProcessTableDelegate {
                 Column::new("pid", "PID").width(px(80.)).text_right(),
                 Column::new("user", "User").width(px(110.)),
                 Column::new("cpu", "CPU").width(px(80.)).text_right(),
+                Column::new("gpu", "GPU").width(px(80.)).text_right(),
                 Column::new("mem", "Memory").width(px(110.)).text_right(),
                 Column::new("disk", "Disk").width(px(110.)).text_right(),
                 Column::new("net", "Network").width(px(110.)).text_right(),
@@ -103,6 +120,8 @@ impl ProcessTableDelegate {
             sort: Some((3, false)), // CPU, descending — Task Manager's default
             filter: String::new(),
             menu_row: None,
+            collapsed_apps: false,
+            collapsed_bg: false,
         }
     }
 
@@ -123,6 +142,9 @@ impl ProcessTableDelegate {
                 desc_s: desc.into(),
                 cpu: p.cpu_percent,
                 cpu_s: format!("{:.1}%", p.cpu_percent).into(),
+                gpu: p.gpu_percent,
+                gpu_s: format!("{:.1}%", p.gpu_percent).into(),
+                has_window: p.has_window,
                 mem: p.raw.private_working_set,
                 mem_s: fmt_bytes(p.raw.private_working_set).into(),
                 disk: p.disk_bytes_per_sec,
@@ -157,27 +179,60 @@ impl ProcessTableDelegate {
     /// numeric columns descending, Task Manager style. Clicking the active
     /// column flips direction.
     fn toggle_sort(&mut self, col: usize) {
-        let text_col = matches!(col, 0 | 2 | 9);
+        let text_col = matches!(col, 0 | 2 | 10);
         self.sort = match self.sort {
             Some((c, asc)) if c == col => Some((col, !asc)),
             _ => Some((col, text_col)),
         };
-        self.apply_sort();
+        self.rebuild_view();
+    }
+
+    fn toggle_section(&mut self, apps: bool) {
+        if apps {
+            self.collapsed_apps = !self.collapsed_apps;
+        } else {
+            self.collapsed_bg = !self.collapsed_bg;
+        }
+        self.rebuild_view();
     }
 
     fn rebuild_view(&mut self) {
-        self.rows = self
+        let mut filtered: Vec<ProcRow> = self
             .all_rows
             .iter()
             .filter(|r| self.matches(r))
             .cloned()
             .collect();
-        self.apply_sort();
+        self.sort_procs(&mut filtered);
+        // While filtering, show a flat list — sections just get in the way.
+        if !self.filter.is_empty() {
+            self.rows = filtered.into_iter().map(Row::Proc).collect();
+            return;
+        }
+        let (apps, bg): (Vec<_>, Vec<_>) = filtered.into_iter().partition(|r| r.has_window);
+        let mut rows = Vec::with_capacity(apps.len() + bg.len() + 2);
+        rows.push(Row::Section {
+            label: format!("Apps ({})", apps.len()).into(),
+            collapsed: self.collapsed_apps,
+            apps: true,
+        });
+        if !self.collapsed_apps {
+            rows.extend(apps.into_iter().map(Row::Proc));
+        }
+        rows.push(Row::Section {
+            label: format!("Background processes ({})", bg.len()).into(),
+            collapsed: self.collapsed_bg,
+            apps: false,
+        });
+        if !self.collapsed_bg {
+            rows.extend(bg.into_iter().map(Row::Proc));
+        }
+        self.rows = rows;
     }
 
-    fn apply_sort(&mut self) {
+    fn sort_procs(&self, procs: &mut [ProcRow]) {
         let Some((col, asc)) = self.sort else { return };
-        self.rows.sort_by(|a, b| {
+        procs.sort_by(|a, b| {
             let ord = match col {
                 0 => a
                     .name
@@ -191,11 +246,12 @@ impl ProcessTableDelegate {
                     .to_ascii_lowercase()
                     .cmp(&b.user_s.as_ref().to_ascii_lowercase()),
                 3 => a.cpu.total_cmp(&b.cpu),
-                4 => a.mem.cmp(&b.mem),
-                5 => a.disk.cmp(&b.disk),
-                6 => a.net.cmp(&b.net),
-                7 => a.threads.cmp(&b.threads),
-                8 => a.handles.cmp(&b.handles),
+                4 => a.gpu.total_cmp(&b.gpu),
+                5 => a.mem.cmp(&b.mem),
+                6 => a.disk.cmp(&b.disk),
+                7 => a.net.cmp(&b.net),
+                8 => a.threads.cmp(&b.threads),
+                9 => a.handles.cmp(&b.handles),
                 _ => a
                     .desc_s
                     .as_ref()
@@ -229,20 +285,46 @@ impl TableDelegate for ProcessTableDelegate {
         row_ix: usize,
         col_ix: usize,
         _window: &mut Window,
-        _cx: &mut Context<TableState<Self>>,
+        cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
-        let row = &self.rows[row_ix];
-        match col_ix {
-            0 => row.name.clone(),
-            1 => row.pid_s.clone(),
-            2 => row.user_s.clone(),
-            3 => row.cpu_s.clone(),
-            4 => row.mem_s.clone(),
-            5 => row.disk_s.clone(),
-            6 => row.net_s.clone(),
-            7 => row.threads_s.clone(),
-            8 => row.handles_s.clone(),
-            _ => row.desc_s.clone(),
+        match &self.rows[row_ix] {
+            Row::Section {
+                label,
+                collapsed,
+                apps,
+            } => {
+                if col_ix != 0 {
+                    return div().into_any_element();
+                }
+                let chevron = if *collapsed { "▶" } else { "▼" };
+                let apps_flag = *apps;
+                div()
+                    .id(("section", row_ix))
+                    .flex()
+                    .items_center()
+                    .text_color(rgb(ACCENT))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |state, _, _, cx| {
+                        state.delegate_mut().toggle_section(apps_flag);
+                        cx.notify();
+                    }))
+                    .child(format!("{chevron}  {label}"))
+                    .into_any_element()
+            }
+            Row::Proc(row) => match col_ix {
+                0 => row.name.clone(),
+                1 => row.pid_s.clone(),
+                2 => row.user_s.clone(),
+                3 => row.cpu_s.clone(),
+                4 => row.gpu_s.clone(),
+                5 => row.mem_s.clone(),
+                6 => row.disk_s.clone(),
+                7 => row.net_s.clone(),
+                8 => row.threads_s.clone(),
+                9 => row.handles_s.clone(),
+                _ => row.desc_s.clone(),
+            }
+            .into_any_element(),
         }
     }
 
@@ -263,7 +345,7 @@ impl TableDelegate for ProcessTableDelegate {
             }
             _ => "",
         };
-        let right_aligned = !matches!(col_ix, 0 | 2 | 9);
+        let right_aligned = !matches!(col_ix, 0 | 2 | 10);
         div()
             .id(("proc-th", col_ix))
             .size_full()
@@ -285,7 +367,7 @@ impl TableDelegate for ProcessTableDelegate {
         _window: &mut Window,
         _cx: &mut Context<TableState<Self>>,
     ) -> PopupMenu {
-        let Some(row) = self.rows.get(row_ix) else {
+        let Some(Row::Proc(row)) = self.rows.get(row_ix) else {
             return menu;
         };
         self.menu_row = Some((row.pid, row.name.clone()));

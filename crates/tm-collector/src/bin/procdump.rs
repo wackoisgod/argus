@@ -42,19 +42,19 @@ fn main() {
         procs.sort_by(|a, b| b.cpu_percent.total_cmp(&a.cpu_percent));
 
         println!(
-            "{:<28} {:>7} {:>6} {:>12} {:>12} {:>12} {:>12} {:>12}",
-            "Name", "PID", "CPU%", "WorkingSet", "Read/s", "Write/s", "Disk/s", "Net/s"
+            "{:<28} {:>7} {:>6} {:>6} {:>12} {:>12} {:>12} {:>12}",
+            "Name", "PID", "CPU%", "GPU%", "WorkingSet", "Read/s", "Write/s", "Net/s"
         );
         for p in procs.iter().take(15) {
             println!(
-                "{:<28} {:>7} {:>6.1} {:>12} {:>12} {:>12} {:>12} {:>12}",
+                "{:<28} {:>7} {:>6.1} {:>6.1} {:>12} {:>12} {:>12} {:>12}",
                 truncate(&p.raw.name, 28),
                 p.raw.pid,
                 p.cpu_percent,
+                p.gpu_percent,
                 fmt_bytes(p.raw.working_set),
                 fmt_bytes(p.read_bytes_per_sec),
                 fmt_bytes(p.write_bytes_per_sec),
-                fmt_bytes(p.disk_bytes_per_sec),
                 fmt_bytes(p.net_bytes_per_sec),
             );
         }
