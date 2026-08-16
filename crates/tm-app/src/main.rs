@@ -307,9 +307,40 @@ struct TaskManagerApp {
     first_snapshot: bool,
 }
 
+/// True when our main window is minimized. The sampler thread discovers its
+/// own process's top-level window and polls `IsIconic` — no cross-thread
+/// plumbing with the UI needed.
+fn window_minimized(hwnd: &mut isize) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowThreadProcessId, IsIconic, IsWindow,
+    };
+    unsafe {
+        if *hwnd != 0 && IsWindow(*hwnd as _) == 0 {
+            *hwnd = 0;
+        }
+        if *hwnd == 0 {
+            unsafe extern "system" fn enum_cb(h: windows_sys::Win32::Foundation::HWND, l: isize) -> i32 {
+                let mut pid = 0u32;
+                GetWindowThreadProcessId(h, &mut pid);
+                if pid == std::process::id() {
+                    *(l as *mut isize) = h as isize;
+                    return 0;
+                }
+                1
+            }
+            let _ = EnumWindows(Some(enum_cb), hwnd as *mut isize as isize);
+        }
+        *hwnd != 0 && IsIconic(*hwnd as _) != 0
+    }
+}
+
 /// Spawn the sampler thread. Called first thing in `main`, before gpui
 /// initializes DirectX/DirectWrite, so collection warms up in parallel with
 /// window creation and data is already waiting when the first frame renders.
+///
+/// Cadence is adaptive: 1s while the window is visible, 2.5s while
+/// minimized — the kernel process query is the app's dominant CPU cost, so
+/// don't pay it for a window nobody can see. Restoring samples immediately.
 fn spawn_sampler() -> futures::channel::mpsc::Receiver<Snapshot> {
     let (tx, rx) = futures::channel::mpsc::channel::<Snapshot>(2);
     std::thread::Builder::new()
@@ -319,12 +350,24 @@ fn spawn_sampler() -> futures::channel::mpsc::Receiver<Snapshot> {
             let mut sampler = Sampler::new();
             sampler.sample(); // baseline for deltas
             // Immediate snapshot (rates read 0) so the first frame has rows,
-            // then a short-delta snapshot for real rates, then 1s cadence.
+            // then a short-delta snapshot for real rates, then the loop.
             let _ = tx.try_send(sampler.sample());
             std::thread::sleep(Duration::from_millis(150));
             let _ = tx.try_send(sampler.sample());
+            let mut hwnd: isize = 0;
             loop {
-                std::thread::sleep(Duration::from_millis(1000));
+                let minimized = window_minimized(&mut hwnd);
+                let interval = if minimized { 2500 } else { 1000 };
+                // Sleep in slices so a restore is noticed within 250ms and
+                // sampled immediately instead of finishing the long sleep.
+                let mut slept = 0;
+                while slept < interval {
+                    std::thread::sleep(Duration::from_millis(250));
+                    slept += 250;
+                    if minimized && !window_minimized(&mut hwnd) {
+                        break;
+                    }
+                }
                 // try_send: if the UI is behind, drop this tick rather than
                 // block the sampler.
                 match tx.try_send(sampler.sample()) {

@@ -17,8 +17,9 @@ pub use nt::RawProcess;
 
 use std::sync::Arc;
 
-use std::collections::HashMap;
 use std::time::Instant;
+
+use rustc_hash::{FxHashMap, FxHashSet};
 use windows_sys::Win32::Foundation::FILETIME;
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows_sys::Win32::System::Threading::GetSystemTimes;
@@ -92,7 +93,7 @@ pub struct Sampler {
     conn: net::ConnQuery,
     raw: Vec<RawProcess>,
     // Keyed by (pid, create_time) so a reused pid doesn't inherit deltas.
-    prev: HashMap<(u32, i64), PrevProc>,
+    prev: FxHashMap<(u32, i64), PrevProc>,
     prev_idle: u64,
     prev_busy_total: u64, // kernel(incl. idle) + user across all cores
     prev_tick: Option<Instant>,
@@ -111,7 +112,7 @@ impl Sampler {
             etw: EtwMonitor::start(),
             conn: net::ConnQuery::new(),
             raw: Vec::new(),
-            prev: HashMap::new(),
+            prev: FxHashMap::default(),
             prev_idle: 0,
             prev_busy_total: 0,
             prev_tick: None,
@@ -164,14 +165,14 @@ impl Sampler {
 
         let mut thread_count = 0u32;
         let mut handle_count = 0u32;
-        let mut next_prev: HashMap<(u32, i64), PrevProc> =
-            HashMap::with_capacity(self.raw.len());
+        let mut next_prev: FxHashMap<(u32, i64), PrevProc> =
+            FxHashMap::with_capacity_and_hasher(self.raw.len(), Default::default());
         let mut processes = Vec::with_capacity(self.raw.len());
         let etw_totals = self.etw.totals();
         // Without ETW, network is approximated from AFD-ioctl counters;
         // only processes actually owning sockets get attributed.
         let conn_pids = if self.etw.active {
-            std::collections::HashSet::new()
+            FxHashSet::default()
         } else {
             self.conn.pids_with_connections()
         };
@@ -233,8 +234,7 @@ impl Sampler {
         }
         self.prev = next_prev;
         self.enricher.retain(|k| self.prev.contains_key(k));
-        let live_pids: std::collections::HashSet<u32> =
-            self.raw.iter().map(|r| r.pid).collect();
+        let live_pids: FxHashSet<u32> = self.raw.iter().map(|r| r.pid).collect();
         self.etw.retain(|pid| live_pids.contains(&pid));
 
         Snapshot {

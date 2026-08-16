@@ -5,9 +5,10 @@
 //! rayon pool; results are cached for the process lifetime and the sampler
 //! only ever does a non-blocking cache lookup.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+
+use rustc_hash::FxHashMap;
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 use windows_sys::Win32::Security::{
@@ -37,12 +38,12 @@ type Key = (u32, i64); // (pid, create_time) — stable across pid reuse
 #[derive(Default)]
 struct WtsUsers {
     refreshed: Option<Instant>,
-    users: HashMap<u32, Arc<str>>,
+    users: FxHashMap<u32, Arc<str>>,
 }
 
 pub struct Enricher {
     /// `None` marks an in-flight resolution so it is scheduled exactly once.
-    cache: Arc<Mutex<HashMap<Key, Option<Arc<Enriched>>>>>,
+    cache: Arc<Mutex<FxHashMap<Key, Option<Arc<Enriched>>>>>,
     wts: Arc<Mutex<WtsUsers>>,
     pool: rayon::ThreadPool,
 }
@@ -59,7 +60,7 @@ impl Enricher {
             .build()
             .expect("build enrich pool");
         Enricher {
-            cache: Arc::new(Mutex::new(HashMap::new())),
+            cache: Arc::new(Mutex::new(FxHashMap::default())),
             wts: Arc::new(Mutex::new(WtsUsers::default())),
             pool,
         }
@@ -199,7 +200,7 @@ fn wts_user(pid: u32, wts: &Mutex<WtsUsers>) -> Option<Arc<str>> {
     wts.users.get(&pid).cloned()
 }
 
-unsafe fn wts_refresh(map: &mut HashMap<u32, Arc<str>>) {
+unsafe fn wts_refresh(map: &mut FxHashMap<u32, Arc<str>>) {
     let mut info: *mut WTS_PROCESS_INFOW = std::ptr::null_mut();
     let mut count = 0u32;
     // WTS_CURRENT_SERVER_HANDLE = null

@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 ferrisetw = "1.2"
 rayon = "1"
+rustc-hash = "2"
 windows-sys = { version = "0.60", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",

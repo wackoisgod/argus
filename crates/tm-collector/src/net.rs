@@ -3,8 +3,7 @@
 //! ETW session is unavailable, so processes doing heavy non-network ioctls
 //! (audio, GPU) don't show phantom network traffic.
 
-use std::collections::HashSet;
-
+use rustc_hash::FxHashSet;
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     GetExtendedTcpTable, GetExtendedUdpTable, TCP_TABLE_OWNER_PID_ALL, UDP_TABLE_OWNER_PID,
 };
@@ -25,8 +24,8 @@ impl ConnQuery {
     }
 
     /// Every pid that owns at least one TCP or UDP endpoint.
-    pub fn pids_with_connections(&mut self) -> HashSet<u32> {
-        let mut pids = HashSet::new();
+    pub fn pids_with_connections(&mut self) -> FxHashSet<u32> {
+        let mut pids = FxHashSet::default();
         // (row size, pid offset) per table layout; see MIB_*ROW_OWNER_PID.
         self.collect(true, AF_INET, 24, 20, &mut pids);
         self.collect(true, AF_INET6, 56, 52, &mut pids);
@@ -41,7 +40,7 @@ impl ConnQuery {
         af: u32,
         row_size: usize,
         pid_offset: usize,
-        out: &mut HashSet<u32>,
+        out: &mut FxHashSet<u32>,
     ) {
         loop {
             let mut size = self.buf.capacity() as u32;

@@ -3,9 +3,10 @@
 //! kernel round-trip. This is the same source Task Manager and Process
 //! Explorer use, and it avoids opening a handle per process.
 
-use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::Arc;
+
+use rustc_hash::FxHashMap;
 
 const SYSTEM_PROCESS_INFORMATION_CLASS: u32 = 5;
 const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004_u32 as i32;
@@ -138,16 +139,16 @@ pub struct RawProcess {
 /// (names only allocate when a new process appears).
 pub struct ProcessQuery {
     buf: Vec<u8>,
-    names: HashMap<(u32, i64), Arc<str>>,
-    names_next: HashMap<(u32, i64), Arc<str>>,
+    names: FxHashMap<(u32, i64), Arc<str>>,
+    names_next: FxHashMap<(u32, i64), Arc<str>>,
 }
 
 impl ProcessQuery {
     pub fn new() -> Self {
         ProcessQuery {
             buf: Vec::with_capacity(512 * 1024),
-            names: HashMap::new(),
-            names_next: HashMap::new(),
+            names: FxHashMap::default(),
+            names_next: FxHashMap::default(),
         }
     }
 
