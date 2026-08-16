@@ -117,7 +117,7 @@ impl ProcessTableDelegate {
             ],
             all_rows: Vec::new(),
             rows: Vec::new(),
-            sort: Some((3, false)), // CPU, descending — Task Manager's default
+            sort: Some((1, true)), // PID, ascending
             filter: String::new(),
             menu_row: None,
             collapsed_apps: false,
