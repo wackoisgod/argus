@@ -13,7 +13,7 @@ use gpui::{
 use gpui::prelude::*;
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::PopupMenu;
-use gpui_component::table::{Column, ColumnSort, Table, TableDelegate, TableState};
+use gpui_component::table::{Column, Table, TableDelegate, TableState};
 use gpui_component::theme::{Theme, ThemeMode};
 use gpui_component::Root;
 use tm_collector::{fmt_bytes, Sampler, Snapshot, SystemStats};
@@ -72,17 +72,21 @@ struct ProcessTableDelegate {
 impl ProcessTableDelegate {
     fn new() -> Self {
         ProcessTableDelegate {
+            // Sorting is fully delegate-owned (see render_th/toggle_sort):
+            // gpui-component's built-in sort only triggers on a small header
+            // icon, which is undiscoverable — we make the whole header cell
+            // clickable instead.
             columns: vec![
-                Column::new("name", "Name").width(px(240.)).sortable(),
-                Column::new("pid", "PID").width(px(80.)).text_right().sortable(),
-                Column::new("user", "User").width(px(110.)).sortable(),
-                Column::new("cpu", "CPU").width(px(80.)).text_right().sortable(),
-                Column::new("mem", "Memory").width(px(110.)).text_right().sortable(),
-                Column::new("disk", "Disk").width(px(110.)).text_right().sortable(),
-                Column::new("net", "Network").width(px(110.)).text_right().sortable(),
-                Column::new("threads", "Threads").width(px(80.)).text_right().sortable(),
-                Column::new("handles", "Handles").width(px(80.)).text_right().sortable(),
-                Column::new("desc", "Description").width(px(320.)).sortable(),
+                Column::new("name", "Name").width(px(240.)),
+                Column::new("pid", "PID").width(px(80.)).text_right(),
+                Column::new("user", "User").width(px(110.)),
+                Column::new("cpu", "CPU").width(px(80.)).text_right(),
+                Column::new("mem", "Memory").width(px(110.)).text_right(),
+                Column::new("disk", "Disk").width(px(110.)).text_right(),
+                Column::new("net", "Network").width(px(110.)).text_right(),
+                Column::new("threads", "Threads").width(px(80.)).text_right(),
+                Column::new("handles", "Handles").width(px(80.)).text_right(),
+                Column::new("desc", "Description").width(px(320.)),
             ],
             all_rows: Vec::new(),
             rows: Vec::new(),
@@ -157,6 +161,18 @@ impl ProcessTableDelegate {
             || row.user_s.as_ref().to_lowercase().contains(&self.filter)
             || row.desc_s.as_ref().to_lowercase().contains(&self.filter)
             || row.pid_s.as_ref().contains(&self.filter)
+    }
+
+    /// Text columns (name/user/description) sort ascending on first click;
+    /// numeric columns descending, Task Manager style. Clicking the active
+    /// column flips direction.
+    fn toggle_sort(&mut self, col: usize) {
+        let text_col = matches!(col, 0 | 2 | 9);
+        self.sort = match self.sort {
+            Some((c, asc)) if c == col => Some((col, !asc)),
+            _ => Some((col, text_col)),
+        };
+        self.apply_sort();
     }
 
     fn rebuild_view(&mut self) {
@@ -240,6 +256,38 @@ impl TableDelegate for ProcessTableDelegate {
         }
     }
 
+    fn render_th(
+        &mut self,
+        col_ix: usize,
+        _window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        let name = self.columns[col_ix].name.clone();
+        let indicator = match self.sort {
+            Some((c, asc)) if c == col_ix => {
+                if asc {
+                    " ▲"
+                } else {
+                    " ▼"
+                }
+            }
+            _ => "",
+        };
+        let right_aligned = !matches!(col_ix, 0 | 2 | 9);
+        div()
+            .id(("proc-th", col_ix))
+            .size_full()
+            .flex()
+            .items_center()
+            .when(right_aligned, |d| d.justify_end())
+            .cursor_pointer()
+            .on_click(cx.listener(move |state, _, _, cx| {
+                state.delegate_mut().toggle_sort(col_ix);
+                cx.notify();
+            }))
+            .child(format!("{name}{indicator}"))
+    }
+
     fn context_menu(
         &mut self,
         row_ix: usize,
@@ -259,20 +307,6 @@ impl TableDelegate for ProcessTableDelegate {
             .menu("Copy Name", Box::new(CopyName))
     }
 
-    fn perform_sort(
-        &mut self,
-        col_ix: usize,
-        sort: ColumnSort,
-        _window: &mut Window,
-        _cx: &mut Context<TableState<Self>>,
-    ) {
-        self.sort = match sort {
-            ColumnSort::Ascending => Some((col_ix, true)),
-            ColumnSort::Descending => Some((col_ix, false)),
-            _ => None,
-        };
-        self.apply_sort();
-    }
 }
 
 struct TaskManagerApp {
@@ -319,7 +353,9 @@ impl TaskManagerApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let table = cx.new(|cx| TableState::new(ProcessTableDelegate::new(), window, cx));
+        let table = cx.new(|cx| {
+            TableState::new(ProcessTableDelegate::new(), window, cx).col_selectable(false)
+        });
 
         let filter_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Filter by name, user, description, or PID")
