@@ -207,6 +207,34 @@ impl Default for Sampler {
     }
 }
 
+/// Terminate a process. Fails with the Win32 error for protected/elevated
+/// processes (access denied = error 5).
+pub fn kill_process(pid: u32) -> Result<(), String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, TerminateProcess, PROCESS_TERMINATE,
+    };
+    unsafe {
+        let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        if handle.is_null() {
+            let err = GetLastError();
+            return Err(if err == 5 {
+                "access denied (elevated process)".to_string()
+            } else {
+                format!("open failed (error {err})")
+            });
+        }
+        let ok = TerminateProcess(handle, 1);
+        let err = GetLastError();
+        CloseHandle(handle);
+        if ok == 0 {
+            Err(format!("terminate failed (error {err})"))
+        } else {
+            Ok(())
+        }
+    }
+}
+
 /// Human-readable byte size, Task Manager style.
 pub fn fmt_bytes(b: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
