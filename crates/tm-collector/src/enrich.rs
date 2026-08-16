@@ -29,6 +29,8 @@ use windows_sys::Win32::System::Threading::{
 pub struct Enriched {
     pub user: Arc<str>,
     pub description: Arc<str>,
+    /// The exe's shell icon, PNG-encoded.
+    pub icon_png: Option<Arc<Vec<u8>>>,
 }
 
 type Key = (u32, i64); // (pid, create_time) — stable across pid reuse
@@ -101,6 +103,7 @@ impl Default for Enricher {
 fn resolve(pid: u32, wts: &Mutex<WtsUsers>) -> Enriched {
     let mut user: Arc<str> = Arc::from("");
     let mut description: Arc<str> = Arc::from("");
+    let mut exe_path: Option<Vec<u16>> = None;
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if !handle.is_null() {
@@ -108,9 +111,7 @@ fn resolve(pid: u32, wts: &Mutex<WtsUsers>) -> Enriched {
             let mut len = path.len() as u32;
             if QueryFullProcessImageNameW(handle, 0, path.as_mut_ptr(), &mut len) != 0 && len > 0
             {
-                if let Some(d) = file_description(&path[..len as usize]) {
-                    description = d;
-                }
+                exe_path = Some(path[..len as usize].to_vec());
             }
             let mut token: HANDLE = std::ptr::null_mut();
             if OpenProcessToken(handle, TOKEN_QUERY, &mut token) != 0 {
@@ -124,13 +125,18 @@ fn resolve(pid: u32, wts: &Mutex<WtsUsers>) -> Enriched {
     }
     // Protected/service processes refuse OpenProcess unelevated, but the
     // kernel will still tell us their image path without a handle; version
-    // resources are world-readable, so the description works for everyone.
-    if description.is_empty() {
-        if let Some(dos) = crate::nt::image_nt_path(pid).and_then(|nt| nt_path_to_dos(&nt)) {
-            if let Some(d) = unsafe { file_description(&dos) } {
-                description = d;
-            }
+    // resources and icons are world-readable, so both work for everyone.
+    if exe_path.is_none() {
+        exe_path = crate::nt::image_nt_path(pid).and_then(|nt| nt_path_to_dos(&nt));
+    }
+    let mut icon_png = None;
+    if let Some(path) = &exe_path {
+        if let Some(d) = unsafe { file_description(path) } {
+            description = d;
         }
+        let mut pathz = path.clone();
+        pathz.push(0);
+        icon_png = crate::icon::icon_png_for_path(&pathz).map(Arc::new);
     }
     // Service/system processes refuse token access unelevated; the WTS
     // enumeration still knows their user (SYSTEM, LOCAL SERVICE, ...).
@@ -139,7 +145,11 @@ fn resolve(pid: u32, wts: &Mutex<WtsUsers>) -> Enriched {
             user = u;
         }
     }
-    Enriched { user, description }
+    Enriched {
+        user,
+        description,
+        icon_png,
+    }
 }
 
 /// Translate "\Device\HarddiskVolumeN\..." to "C:\..." using the dos-device

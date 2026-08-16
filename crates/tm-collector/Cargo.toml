@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 ferrisetw = "1.2"
+image = { version = "0.25", default-features = false, features = ["png"] }
 rayon = "1"
 rustc-hash = "2"
 windows-sys = { version = "0.60", features = [
@@ -18,6 +19,8 @@ windows-sys = { version = "0.60", features = [
     "Win32_System_ProcessStatus",
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_Shell",
 ] }
 
 [[bin]]

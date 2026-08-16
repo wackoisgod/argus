@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 futures = "0.3"
 gpui = "0.2"
+rustc-hash = "2"
 gpui-component = "0.5"
 tm-collector = { path = "../tm-collector" }
 windows-sys = { version = "0.60", features = [

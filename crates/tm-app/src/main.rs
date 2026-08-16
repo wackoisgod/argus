@@ -47,11 +47,14 @@ fn fmt_mbps(bytes_per_sec: u64) -> String {
 /// arrives; render only clones refcounted `SharedString`s.
 #[derive(Clone)]
 struct ProcRow {
+    /// Display name: file description when known, exe name otherwise.
     name: SharedString,
+    /// The executable file name.
+    exe_s: SharedString,
+    icon: Option<std::sync::Arc<Vec<u8>>>,
     pid: u32,
     pid_s: SharedString,
     user_s: SharedString,
-    desc_s: SharedString,
     cpu: f32,
     cpu_s: SharedString,
     gpu: f32,
@@ -93,6 +96,9 @@ struct HeaderTotals {
 struct ProcessTableDelegate {
     columns: Vec<Column>,
     totals: HeaderTotals,
+    /// pid → (source-bytes identity, decoded image), so gpui sees a stable
+    /// image id per icon instead of re-decoding every refresh.
+    icon_cache: rustc_hash::FxHashMap<u32, (usize, std::sync::Arc<gpui::Image>)>,
     /// Every process from the latest snapshot, unfiltered and unsorted.
     all_rows: Vec<ProcRow>,
     /// The visible view: sections + filtered, sorted processes.
@@ -126,10 +132,11 @@ impl ProcessTableDelegate {
                 Column::new("net", "Network").width(px(110.)).text_right(),
                 Column::new("threads", "Threads").width(px(80.)).text_right(),
                 Column::new("handles", "Handles").width(px(80.)).text_right(),
-                Column::new("desc", "Description").width(px(320.)),
+                Column::new("exe", "Process name").width(px(280.)),
             ],
             all_rows: Vec::new(),
             totals: HeaderTotals::default(),
+            icon_cache: rustc_hash::FxHashMap::default(),
             rows: Vec::new(),
             sort: Some(("pid".into(), true)),
             filter: String::new(),
@@ -153,17 +160,29 @@ impl ProcessTableDelegate {
         self.all_rows.clear();
         self.all_rows.reserve(snap.processes.len());
         for p in snap.processes.iter().filter(|p| p.raw.pid != 0) {
-            let (user, desc) = p
+            let (user, desc, icon) = p
                 .enriched
                 .as_ref()
-                .map(|e| (e.user.to_string(), e.description.to_string()))
+                .map(|e| {
+                    (
+                        e.user.to_string(),
+                        e.description.to_string(),
+                        e.icon_png.clone(),
+                    )
+                })
                 .unwrap_or_default();
+            let exe = p.raw.name.to_string();
             self.all_rows.push(ProcRow {
-                name: p.raw.name.to_string().into(),
+                name: if desc.is_empty() {
+                    exe.clone().into()
+                } else {
+                    desc.into()
+                },
+                exe_s: exe.into(),
+                icon,
                 pid: p.raw.pid,
                 pid_s: p.raw.pid.to_string().into(),
                 user_s: user.into(),
-                desc_s: desc.into(),
                 cpu: p.cpu_percent,
                 cpu_s: format!("{:.1}%", p.cpu_percent).into(),
                 gpu: p.gpu_percent,
@@ -181,6 +200,8 @@ impl ProcessTableDelegate {
                 handles_s: p.raw.handles.to_string().into(),
             });
         }
+        let live: rustc_hash::FxHashSet<u32> = self.all_rows.iter().map(|r| r.pid).collect();
+        self.icon_cache.retain(|pid, _| live.contains(pid));
         self.rebuild_view();
     }
 
@@ -194,13 +215,13 @@ impl ProcessTableDelegate {
             return true;
         }
         row.name.as_ref().to_lowercase().contains(&self.filter)
+            || row.exe_s.as_ref().to_lowercase().contains(&self.filter)
             || row.user_s.as_ref().to_lowercase().contains(&self.filter)
-            || row.desc_s.as_ref().to_lowercase().contains(&self.filter)
             || row.pid_s.as_ref().contains(&self.filter)
     }
 
     fn is_text_column(key: &str) -> bool {
-        matches!(key, "name" | "user" | "desc")
+        matches!(key, "name" | "user" | "exe")
     }
 
     /// Text columns (name/user/description) sort ascending on first click;
@@ -214,6 +235,23 @@ impl ProcessTableDelegate {
             _ => Some((key, text_col)),
         };
         self.rebuild_view();
+    }
+
+    /// Decode-once icon lookup: gpui identifies images by id, so handing it
+    /// a fresh Image every refresh would re-decode and re-upload each tick.
+    fn icon_image(&mut self, pid: u32, bytes: &std::sync::Arc<Vec<u8>>) -> std::sync::Arc<gpui::Image> {
+        let identity = std::sync::Arc::as_ptr(bytes) as usize;
+        if let Some((cached_id, image)) = self.icon_cache.get(&pid) {
+            if *cached_id == identity {
+                return image.clone();
+            }
+        }
+        let image = std::sync::Arc::new(gpui::Image::from_bytes(
+            gpui::ImageFormat::Png,
+            (**bytes).clone(),
+        ));
+        self.icon_cache.insert(pid, (identity, image.clone()));
+        image
     }
 
     fn toggle_section(&mut self, apps: bool) {
@@ -283,10 +321,10 @@ impl ProcessTableDelegate {
                 "threads" => a.threads.cmp(&b.threads),
                 "handles" => a.handles.cmp(&b.handles),
                 _ => a
-                    .desc_s
+                    .exe_s
                     .as_ref()
                     .to_ascii_lowercase()
-                    .cmp(&b.desc_s.as_ref().to_ascii_lowercase()),
+                    .cmp(&b.exe_s.as_ref().to_ascii_lowercase()),
             };
             if asc {
                 ord
@@ -341,20 +379,41 @@ impl TableDelegate for ProcessTableDelegate {
                     .child(format!("{chevron}  {label}"))
                     .into_any_element()
             }
-            Row::Proc(row) => match self.columns[col_ix].key.as_ref() {
-                "name" => row.name.clone(),
-                "pid" => row.pid_s.clone(),
-                "user" => row.user_s.clone(),
-                "cpu" => row.cpu_s.clone(),
-                "gpu" => row.gpu_s.clone(),
-                "mem" => row.mem_s.clone(),
-                "disk" => row.disk_s.clone(),
-                "net" => row.net_s.clone(),
-                "threads" => row.threads_s.clone(),
-                "handles" => row.handles_s.clone(),
-                _ => row.desc_s.clone(),
+            Row::Proc(row) => {
+                let row = row.clone();
+                match self.columns[col_ix].key.as_ref() {
+                    "name" => {
+                        let icon = row
+                            .icon
+                            .as_ref()
+                            .map(|bytes| self.icon_image(row.pid, bytes));
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(match icon {
+                                Some(image) => gpui::img(image)
+                                    .w(px(16.))
+                                    .h(px(16.))
+                                    .flex_none()
+                                    .into_any_element(),
+                                None => div().w(px(16.)).flex_none().into_any_element(),
+                            })
+                            .child(row.name.clone())
+                            .into_any_element()
+                    }
+                    "pid" => row.pid_s.clone().into_any_element(),
+                    "user" => row.user_s.clone().into_any_element(),
+                    "cpu" => row.cpu_s.clone().into_any_element(),
+                    "gpu" => row.gpu_s.clone().into_any_element(),
+                    "mem" => row.mem_s.clone().into_any_element(),
+                    "disk" => row.disk_s.clone().into_any_element(),
+                    "net" => row.net_s.clone().into_any_element(),
+                    "threads" => row.threads_s.clone().into_any_element(),
+                    "handles" => row.handles_s.clone().into_any_element(),
+                    _ => row.exe_s.clone().into_any_element(),
+                }
             }
-            .into_any_element(),
         }
     }
 

@@ -9,6 +9,7 @@
 mod enrich;
 mod etw;
 mod gpu;
+mod icon;
 mod net;
 mod nt;
 mod windows_q;
