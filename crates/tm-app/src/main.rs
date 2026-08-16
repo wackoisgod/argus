@@ -29,6 +29,7 @@ fn tlog(label: &str) {
 }
 
 const BG_HEADER: u32 = 0x1e1e2e;
+const TEXT: u32 = 0xcdd6f4;
 const TEXT_DIM: u32 = 0x7f849c;
 const ACCENT: u32 = 0x89b4fa;
 
@@ -79,8 +80,19 @@ enum Row {
     Proc(ProcRow),
 }
 
+/// Aggregated totals shown on the second header line, Task Manager style.
+#[derive(Default)]
+struct HeaderTotals {
+    cpu: SharedString,
+    gpu: SharedString,
+    mem: SharedString,
+    disk: SharedString,
+    net: SharedString,
+}
+
 struct ProcessTableDelegate {
     columns: Vec<Column>,
+    totals: HeaderTotals,
     /// Every process from the latest snapshot, unfiltered and unsorted.
     all_rows: Vec<ProcRow>,
     /// The visible view: sections + filtered, sorted processes.
@@ -117,6 +129,7 @@ impl ProcessTableDelegate {
                 Column::new("desc", "Description").width(px(320.)),
             ],
             all_rows: Vec::new(),
+            totals: HeaderTotals::default(),
             rows: Vec::new(),
             sort: Some(("pid".into(), true)),
             filter: String::new(),
@@ -127,6 +140,16 @@ impl ProcessTableDelegate {
     }
 
     fn set_snapshot(&mut self, snap: &Snapshot) {
+        let gpu_total: f32 = snap.processes.iter().map(|p| p.gpu_percent).sum();
+        let disk_total: u64 = snap.processes.iter().map(|p| p.disk_bytes_per_sec).sum();
+        let net_total: u64 = snap.processes.iter().map(|p| p.net_bytes_per_sec).sum();
+        self.totals = HeaderTotals {
+            cpu: format!("{:.1}%", snap.system.cpu_percent).into(),
+            gpu: format!("{gpu_total:.1}%").into(),
+            mem: format!("{:.1}%", snap.system.mem_percent()).into(),
+            disk: fmt_mibs(disk_total).into(),
+            net: fmt_mbps(net_total).into(),
+        };
         self.all_rows.clear();
         self.all_rows.reserve(snap.processes.len());
         for p in snap.processes.iter().filter(|p| p.raw.pid != 0) {
@@ -348,6 +371,16 @@ impl TableDelegate for ProcessTableDelegate {
         self.columns.insert(to_ix, col);
     }
 
+    fn render_header(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<TableState<Self>>,
+    ) -> gpui::Stateful<gpui::Div> {
+        // Taller two-line header (name + aggregated total) in readable text
+        // instead of the theme's muted header color.
+        div().id("header").h(px(46.)).text_color(rgb(TEXT))
+    }
+
     fn render_th(
         &mut self,
         col_ix: usize,
@@ -366,19 +399,29 @@ impl TableDelegate for ProcessTableDelegate {
             }
             _ => "",
         };
+        let total = match key.as_ref() {
+            "cpu" => Some(self.totals.cpu.clone()),
+            "gpu" => Some(self.totals.gpu.clone()),
+            "mem" => Some(self.totals.mem.clone()),
+            "disk" => Some(self.totals.disk.clone()),
+            "net" => Some(self.totals.net.clone()),
+            _ => None,
+        };
         let right_aligned = !Self::is_text_column(key.as_ref());
         div()
             .id(("proc-th", col_ix))
             .size_full()
             .flex()
-            .items_center()
-            .when(right_aligned, |d| d.justify_end())
+            .flex_col()
+            .justify_center()
+            .when(right_aligned, |d| d.items_end())
             .cursor_pointer()
             .on_click(cx.listener(move |state, _, _, cx| {
                 state.delegate_mut().toggle_sort(col_ix);
                 cx.notify();
             }))
             .child(format!("{name}{indicator}"))
+            .when_some(total, |d, total| d.child(total))
     }
 
     fn context_menu(
