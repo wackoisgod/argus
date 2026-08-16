@@ -32,6 +32,16 @@ const BG_HEADER: u32 = 0x1e1e2e;
 const TEXT_DIM: u32 = 0x7f849c;
 const ACCENT: u32 = 0x89b4fa;
 
+/// Disk rates in fixed MiB/s, Task Manager style.
+fn fmt_mibs(bytes_per_sec: u64) -> String {
+    format!("{:.2} MiB/s", bytes_per_sec as f64 / (1024.0 * 1024.0))
+}
+
+/// Network rates in fixed megabits/sec, Task Manager style.
+fn fmt_mbps(bytes_per_sec: u64) -> String {
+    format!("{:.2} Mbps", bytes_per_sec as f64 * 8.0 / 1_000_000.0)
+}
+
 /// One display row. All strings are formatted exactly once, when the snapshot
 /// arrives; render only clones refcounted `SharedString`s.
 #[derive(Clone)]
@@ -97,7 +107,6 @@ impl ProcessTableDelegate {
     }
 
     fn set_snapshot(&mut self, snap: &Snapshot) {
-        let etw = snap.system.etw_active;
         self.all_rows.clear();
         self.all_rows.reserve(snap.processes.len());
         for p in snap.processes.iter().filter(|p| p.raw.pid != 0) {
@@ -116,29 +125,10 @@ impl ProcessTableDelegate {
                 cpu_s: format!("{:.1}%", p.cpu_percent).into(),
                 mem: p.raw.private_working_set,
                 mem_s: fmt_bytes(p.raw.private_working_set).into(),
-                // Disk falls back to I/O transfer counters (an approximation
-                // that includes pipe/device I/O) when ETW is unavailable;
-                // network has no counter fallback.
-                disk: if etw {
-                    p.disk_bytes_per_sec
-                } else {
-                    p.read_bytes_per_sec + p.write_bytes_per_sec
-                },
-                disk_s: if etw {
-                    format!("{}/s", fmt_bytes(p.disk_bytes_per_sec)).into()
-                } else {
-                    format!(
-                        "{}/s*",
-                        fmt_bytes(p.read_bytes_per_sec + p.write_bytes_per_sec)
-                    )
-                    .into()
-                },
+                disk: p.disk_bytes_per_sec,
+                disk_s: fmt_mibs(p.disk_bytes_per_sec).into(),
                 net: p.net_bytes_per_sec,
-                net_s: if etw {
-                    format!("{}/s", fmt_bytes(p.net_bytes_per_sec)).into()
-                } else {
-                    "—".into()
-                },
+                net_s: fmt_mbps(p.net_bytes_per_sec).into(),
                 threads: p.raw.threads,
                 threads_s: p.raw.threads.to_string().into(),
                 handles: p.raw.handles,
@@ -456,11 +446,6 @@ impl Render for TaskManagerApp {
             .child(div().w(px(340.)).child(Input::new(&self.filter_input)))
             .when_some(self.status.clone(), |this, status| {
                 this.child(div().text_color(rgb(TEXT_DIM)).child(status))
-            })
-            .when(self.first_snapshot && !self.sys.etw_active, |this| {
-                this.child(div().text_color(rgb(TEXT_DIM)).child(
-                    "* Disk approximated from I/O counters; run elevated for true disk & network",
-                ))
             });
 
         div()

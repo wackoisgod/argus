@@ -7,13 +7,17 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 use windows_sys::Win32::Security::{
     GetTokenInformation, LookupAccountSidW, TokenUser, SID_NAME_USE, TOKEN_QUERY, TOKEN_USER,
 };
+use windows_sys::Win32::System::RemoteDesktop::{
+    WTSEnumerateProcessesW, WTSFreeMemory, WTS_PROCESS_INFOW,
+};
 use windows_sys::Win32::Storage::FileSystem::{
-    GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW,
+    GetFileVersionInfoSizeW, GetFileVersionInfoW, QueryDosDeviceW, VerQueryValueW,
 };
 use windows_sys::Win32::System::Threading::{
     GetCurrentThread, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
@@ -28,9 +32,18 @@ pub struct Enriched {
 
 type Key = (u32, i64); // (pid, create_time) — stable across pid reuse
 
+/// Pid→user map from WTS enumeration. Works unelevated for every process
+/// (including services), unlike opening each process's token.
+#[derive(Default)]
+struct WtsUsers {
+    refreshed: Option<Instant>,
+    users: HashMap<u32, Arc<str>>,
+}
+
 pub struct Enricher {
     /// `None` marks an in-flight resolution so it is scheduled exactly once.
     cache: Arc<Mutex<HashMap<Key, Option<Arc<Enriched>>>>>,
+    wts: Arc<Mutex<WtsUsers>>,
     pool: rayon::ThreadPool,
 }
 
@@ -47,6 +60,7 @@ impl Enricher {
             .expect("build enrich pool");
         Enricher {
             cache: Arc::new(Mutex::new(HashMap::new())),
+            wts: Arc::new(Mutex::new(WtsUsers::default())),
             pool,
         }
     }
@@ -61,8 +75,9 @@ impl Enricher {
                 cache.insert(key, None);
                 drop(cache);
                 let cache = Arc::clone(&self.cache);
+                let wts = Arc::clone(&self.wts);
                 self.pool.spawn(move || {
-                    let info = Arc::new(resolve(key.0));
+                    let info = Arc::new(resolve(key.0, &wts));
                     cache.lock().unwrap().insert(key, Some(info));
                 });
                 None
@@ -82,31 +97,126 @@ impl Default for Enricher {
     }
 }
 
-fn resolve(pid: u32) -> Enriched {
+fn resolve(pid: u32, wts: &Mutex<WtsUsers>) -> Enriched {
     let mut user: Arc<str> = Arc::from("");
     let mut description: Arc<str> = Arc::from("");
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-        if handle.is_null() {
-            return Enriched { user, description };
+        if !handle.is_null() {
+            let mut path = [0u16; 1024];
+            let mut len = path.len() as u32;
+            if QueryFullProcessImageNameW(handle, 0, path.as_mut_ptr(), &mut len) != 0 && len > 0
+            {
+                if let Some(d) = file_description(&path[..len as usize]) {
+                    description = d;
+                }
+            }
+            let mut token: HANDLE = std::ptr::null_mut();
+            if OpenProcessToken(handle, TOKEN_QUERY, &mut token) != 0 {
+                if let Some(u) = token_user(token) {
+                    user = u;
+                }
+                CloseHandle(token);
+            }
+            CloseHandle(handle);
         }
-        let mut path = [0u16; 1024];
-        let mut len = path.len() as u32;
-        if QueryFullProcessImageNameW(handle, 0, path.as_mut_ptr(), &mut len) != 0 && len > 0 {
-            if let Some(d) = file_description(&path[..len as usize]) {
+    }
+    // Protected/service processes refuse OpenProcess unelevated, but the
+    // kernel will still tell us their image path without a handle; version
+    // resources are world-readable, so the description works for everyone.
+    if description.is_empty() {
+        if let Some(dos) = crate::nt::image_nt_path(pid).and_then(|nt| nt_path_to_dos(&nt)) {
+            if let Some(d) = unsafe { file_description(&dos) } {
                 description = d;
             }
         }
-        let mut token: HANDLE = std::ptr::null_mut();
-        if OpenProcessToken(handle, TOKEN_QUERY, &mut token) != 0 {
-            if let Some(u) = token_user(token) {
-                user = u;
-            }
-            CloseHandle(token);
+    }
+    // Service/system processes refuse token access unelevated; the WTS
+    // enumeration still knows their user (SYSTEM, LOCAL SERVICE, ...).
+    if user.is_empty() {
+        if let Some(u) = wts_user(pid, wts) {
+            user = u;
         }
-        CloseHandle(handle);
     }
     Enriched { user, description }
+}
+
+/// Translate "\Device\HarddiskVolumeN\..." to "C:\..." using the dos-device
+/// mappings; version APIs don't accept NT paths.
+fn nt_path_to_dos(nt: &[u16]) -> Option<Vec<u16>> {
+    use std::sync::OnceLock;
+    static DEVICES: OnceLock<Vec<(Vec<u16>, [u16; 2])>> = OnceLock::new();
+    let devices = DEVICES.get_or_init(|| {
+        let mut out = Vec::new();
+        let mut target = [0u16; 512];
+        for letter in b'A'..=b'Z' {
+            let drive = [letter as u16, b':' as u16, 0];
+            let n = unsafe { QueryDosDeviceW(drive.as_ptr(), target.as_mut_ptr(), 512) };
+            if n > 0 {
+                let end = target.iter().position(|&c| c == 0).unwrap_or(0);
+                if end > 0 {
+                    out.push((target[..end].to_vec(), [letter as u16, b':' as u16]));
+                }
+            }
+        }
+        out
+    });
+    fn fold(c: u16) -> u16 {
+        if (b'A' as u16..=b'Z' as u16).contains(&c) {
+            c + 32
+        } else {
+            c
+        }
+    }
+    for (device, drive) in devices {
+        if nt.len() > device.len()
+            && nt[..device.len()]
+                .iter()
+                .zip(device.iter())
+                .all(|(a, b)| fold(*a) == fold(*b))
+            && nt[device.len()] == b'\\' as u16
+        {
+            let mut dos = drive.to_vec();
+            dos.extend_from_slice(&nt[device.len()..]);
+            return Some(dos);
+        }
+    }
+    None
+}
+
+fn wts_user(pid: u32, wts: &Mutex<WtsUsers>) -> Option<Arc<str>> {
+    let mut wts = wts.lock().unwrap();
+    let stale = wts
+        .refreshed
+        .map(|t| t.elapsed().as_secs() >= 5)
+        .unwrap_or(true);
+    if stale || !wts.users.contains_key(&pid) {
+        if stale {
+            wts.refreshed = Some(Instant::now());
+            unsafe { wts_refresh(&mut wts.users) };
+        }
+    }
+    wts.users.get(&pid).cloned()
+}
+
+unsafe fn wts_refresh(map: &mut HashMap<u32, Arc<str>>) {
+    let mut info: *mut WTS_PROCESS_INFOW = std::ptr::null_mut();
+    let mut count = 0u32;
+    // WTS_CURRENT_SERVER_HANDLE = null
+    if WTSEnumerateProcessesW(std::ptr::null_mut(), 0, 1, &mut info, &mut count) == 0 {
+        return;
+    }
+    map.clear();
+    for i in 0..count as usize {
+        let entry = &*info.add(i);
+        if entry.pUserSid.is_null() {
+            continue;
+        }
+        if let Some(name) = sid_to_name(entry.pUserSid) {
+            map.insert(entry.ProcessId, name);
+        }
+    }
+    WTSFreeMemory(info.cast());
 }
 
 /// Read FileDescription from the executable's version resource.
@@ -167,6 +277,10 @@ unsafe fn token_user(token: HANDLE) -> Option<Arc<str>> {
         return None;
     }
     let sid = (*(buf.as_ptr() as *const TOKEN_USER)).User.Sid;
+    sid_to_name(sid)
+}
+
+unsafe fn sid_to_name(sid: *mut core::ffi::c_void) -> Option<Arc<str>> {
     let mut name = [0u16; 256];
     let mut name_len = name.len() as u32;
     let mut domain = [0u16; 256];

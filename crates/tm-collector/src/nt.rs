@@ -12,12 +12,47 @@ const STATUS_INFO_LENGTH_MISMATCH: i32 = 0xC000_0004_u32 as i32;
 
 #[link(name = "ntdll")]
 extern "system" {
-    fn NtQuerySystemInformation(
+    pub(crate) fn NtQuerySystemInformation(
         class: u32,
         buffer: *mut c_void,
         length: u32,
         return_length: *mut u32,
     ) -> i32;
+}
+
+const SYSTEM_PROCESS_ID_INFORMATION_CLASS: u32 = 88;
+
+/// Query a process's NT image path (\Device\HarddiskVolumeN\...) without
+/// opening a handle — works unelevated for every process, including
+/// protected ones and services.
+pub(crate) fn image_nt_path(pid: u32) -> Option<Vec<u16>> {
+    #[repr(C)]
+    struct SystemProcessIdInformation {
+        process_id: usize,
+        image_name: UnicodeString,
+    }
+    let mut buf = vec![0u16; 600];
+    let mut info = SystemProcessIdInformation {
+        process_id: pid as usize,
+        image_name: UnicodeString {
+            length: 0,
+            maximum_length: (buf.len() * 2) as u16,
+            buffer: buf.as_mut_ptr(),
+        },
+    };
+    let status = unsafe {
+        NtQuerySystemInformation(
+            SYSTEM_PROCESS_ID_INFORMATION_CLASS,
+            &mut info as *mut _ as *mut c_void,
+            std::mem::size_of::<SystemProcessIdInformation>() as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    if status < 0 || info.image_name.length == 0 {
+        return None;
+    }
+    let chars = info.image_name.length as usize / 2;
+    Some(buf[..chars].to_vec())
 }
 
 #[repr(C)]

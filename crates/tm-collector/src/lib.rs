@@ -8,6 +8,7 @@
 
 mod enrich;
 mod etw;
+mod net;
 mod nt;
 
 pub use enrich::{Enriched, Enricher};
@@ -30,9 +31,12 @@ pub struct ProcessStats {
     pub cpu_percent: f32,
     pub read_bytes_per_sec: u64,
     pub write_bytes_per_sec: u64,
-    /// True disk bytes/sec from kernel ETW (0 when ETW is unavailable).
+    /// Disk bytes/sec. Kernel-ETW truth when the session is available,
+    /// otherwise approximated from read+write transfer counters.
     pub disk_bytes_per_sec: u64,
-    /// True network bytes/sec (TCP+UDP send+recv) from kernel ETW.
+    /// Network bytes/sec. Kernel-ETW truth when available; otherwise
+    /// approximated from "other" transfer counters (socket I/O flows through
+    /// AFD ioctls), gated to processes that own TCP/UDP endpoints.
     pub net_bytes_per_sec: u64,
     /// User + description, resolved asynchronously on the enrichment pool;
     /// `None` until the first resolution for this process completes.
@@ -77,6 +81,7 @@ struct PrevProc {
     cpu_100ns: i64,
     read_bytes: u64,
     write_bytes: u64,
+    other_bytes: u64,
     etw: IoTotals,
 }
 
@@ -84,6 +89,7 @@ pub struct Sampler {
     query: nt::ProcessQuery,
     enricher: Enricher,
     etw: EtwMonitor,
+    conn: net::ConnQuery,
     raw: Vec<RawProcess>,
     // Keyed by (pid, create_time) so a reused pid doesn't inherit deltas.
     prev: HashMap<(u32, i64), PrevProc>,
@@ -103,6 +109,7 @@ impl Sampler {
             query: nt::ProcessQuery::new(),
             enricher: Enricher::new(),
             etw: EtwMonitor::start(),
+            conn: net::ConnQuery::new(),
             raw: Vec::new(),
             prev: HashMap::new(),
             prev_idle: 0,
@@ -161,6 +168,13 @@ impl Sampler {
             HashMap::with_capacity(self.raw.len());
         let mut processes = Vec::with_capacity(self.raw.len());
         let etw_totals = self.etw.totals();
+        // Without ETW, network is approximated from AFD-ioctl counters;
+        // only processes actually owning sockets get attributed.
+        let conn_pids = if self.etw.active {
+            std::collections::HashSet::new()
+        } else {
+            self.conn.pids_with_connections()
+        };
 
         for raw in &self.raw {
             thread_count += raw.threads;
@@ -180,12 +194,21 @@ impl Sampler {
                         / elapsed) as u64;
                     write_bps = ((raw.write_bytes.saturating_sub(prev.write_bytes)) as f64
                         / elapsed) as u64;
-                    let d_disk = (etw.disk_read + etw.disk_write)
-                        .saturating_sub(prev.etw.disk_read + prev.etw.disk_write);
-                    let d_net = (etw.net_send + etw.net_recv)
-                        .saturating_sub(prev.etw.net_send + prev.etw.net_recv);
-                    disk_bps = (d_disk as f64 / elapsed) as u64;
-                    net_bps = (d_net as f64 / elapsed) as u64;
+                    if self.etw.active {
+                        let d_disk = (etw.disk_read + etw.disk_write)
+                            .saturating_sub(prev.etw.disk_read + prev.etw.disk_write);
+                        let d_net = (etw.net_send + etw.net_recv)
+                            .saturating_sub(prev.etw.net_send + prev.etw.net_recv);
+                        disk_bps = (d_disk as f64 / elapsed) as u64;
+                        net_bps = (d_net as f64 / elapsed) as u64;
+                    } else {
+                        disk_bps = read_bps + write_bps;
+                        if conn_pids.contains(&raw.pid) {
+                            let d_other =
+                                raw.other_bytes.saturating_sub(prev.other_bytes);
+                            net_bps = (d_other as f64 / elapsed) as u64;
+                        }
+                    }
                 }
             }
             next_prev.insert(
@@ -194,6 +217,7 @@ impl Sampler {
                     cpu_100ns,
                     read_bytes: raw.read_bytes,
                     write_bytes: raw.write_bytes,
+                    other_bytes: raw.other_bytes,
                     etw,
                 },
             );
