@@ -382,6 +382,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs an active desktop GPU workload; run locally with --ignored"]
     fn some_process_has_gpu_time() {
         // At least one process on a desktop system (usually a browser or
         // compositor we can open) should report cumulative GPU running time.
