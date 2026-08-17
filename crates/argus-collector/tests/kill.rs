@@ -7,7 +7,7 @@ fn kill_terminates_child() {
         .stdout(Stdio::null())
         .spawn()
         .expect("spawn child");
-    tm_collector::kill_process(child.id()).expect("kill_process");
+    argus_collector::kill_process(child.id()).expect("kill_process");
     let status = child.wait().expect("wait");
     assert!(!status.success(), "terminated child should not exit cleanly");
 }
@@ -15,5 +15,5 @@ fn kill_terminates_child() {
 #[test]
 fn kill_nonexistent_pid_errors() {
     // Pids are multiples of 4; 3 can never be a valid process id.
-    assert!(tm_collector::kill_process(3).is_err());
+    assert!(argus_collector::kill_process(3).is_err());
 }

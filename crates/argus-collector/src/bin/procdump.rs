@@ -3,7 +3,7 @@
 //! checked against Task Manager side by side.
 
 use std::time::Duration;
-use tm_collector::{fmt_bytes, Sampler};
+use argus_collector::{fmt_bytes, Sampler};
 
 fn main() {
     let ticks: u32 = std::env::args()

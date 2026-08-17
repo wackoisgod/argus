@@ -16,7 +16,7 @@ use gpui_component::menu::PopupMenu;
 use gpui_component::table::{Column, Table, TableDelegate, TableState};
 use gpui_component::theme::{Theme, ThemeMode};
 use gpui_component::Root;
-use tm_collector::{fmt_bytes, Sampler, Snapshot, SystemStats};
+use argus_collector::{fmt_bytes, Sampler, Snapshot, SystemStats};
 
 mod perf_ui;
 
@@ -915,7 +915,7 @@ impl TaskManagerApp {
         let Some((pid, name)) = self.menu_row(cx) else {
             return;
         };
-        self.status = Some(match tm_collector::kill_process(pid) {
+        self.status = Some(match argus_collector::kill_process(pid) {
             Ok(()) => format!("Ended {name} ({pid})").into(),
             Err(e) => format!("Could not end {name} ({pid}): {e}").into(),
         });
@@ -1050,7 +1050,7 @@ fn main() {
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(gpui::TitlebarOptions {
-                    title: Some("Task Manager".into()),
+                    title: Some("Argus".into()),
                     ..Default::default()
                 }),
                 ..Default::default()

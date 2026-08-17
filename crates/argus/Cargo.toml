@@ -1,5 +1,5 @@
 [package]
-name = "tm-app"
+name = "argus"
 version = "0.1.0"
 edition.workspace = true
 
@@ -8,7 +8,7 @@ futures = "0.3"
 gpui = "0.2"
 rustc-hash = "2"
 gpui-component = "0.5"
-tm-collector = { path = "../tm-collector" }
+argus-collector = { path = "../argus-collector" }
 windows-sys = { version = "0.60", features = [
     "Win32_Foundation",
     "Win32_System_Threading",

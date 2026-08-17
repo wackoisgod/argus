@@ -13,8 +13,8 @@ fn main() {
     // Version resource so our own row shows a Description, like everyone
     // else's processes do.
     let mut res = winres::WindowsResource::new();
-    res.set("FileDescription", "Task Manager");
-    res.set("ProductName", "Task Manager");
+    res.set("FileDescription", "Argus");
+    res.set("ProductName", "Argus");
     if let Err(e) = res.compile() {
         println!("cargo:warning=version resource skipped: {e}");
     }

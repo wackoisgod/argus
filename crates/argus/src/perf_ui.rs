@@ -9,7 +9,7 @@ use gpui::{
     canvas, div, point, prelude::*, px, rgb, rgba, AnyElement, Context, SharedString, Window,
 };
 use rustc_hash::FxHashMap;
-use tm_collector::{fmt_bytes, PerfInfo, Snapshot};
+use argus_collector::{fmt_bytes, PerfInfo, Snapshot};
 
 use crate::{fmt_mbps, TaskManagerApp, ACCENT, BG_HEADER, TEXT, TEXT_DIM};
 

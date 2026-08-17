@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/tm-collector", "crates/tm-app"]
+members = ["crates/argus-collector", "crates/argus"]
 
 [workspace.package]
 edition = "2021"
