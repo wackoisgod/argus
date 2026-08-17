@@ -308,6 +308,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dxgi_map_debug() {
+        for ((low, high), name) in dxgi_adapter_names() {
+            eprintln!("dxgi: luid {high:08x}:{low:08x} = '{name}'");
+        }
+        let m = GpuMonitor::new();
+        for a in &m.adapters {
+            eprintln!("kmt:  luid {:08x}:{:08x} nodes {}", a.luid_high, a.luid_low, a.node_count);
+        }
+    }
+
+    #[test]
+    fn adapter_names_debug() {
+        let m = GpuMonitor::new();
+        for (i, a) in m.adapters.iter().enumerate() {
+            let mut buf = vec![0u16; 1040];
+            let mut q = QueryAdapterInfo {
+                h_adapter: a.h_adapter,
+                ty: KMTQAITYPE_ADAPTERREGISTRYINFO,
+                data: buf.as_mut_ptr().cast(),
+                size: 2080,
+                _pad: 0,
+            };
+            let status = unsafe { D3DKMTQueryAdapterInfo(&mut q) };
+            let end = buf[..260].iter().position(|&c| c == 0).unwrap_or(0);
+            eprintln!(
+                "adapter {i}: h={:#x} nodes={} status={status:#010x} name='{}' (resolved '{}')",
+                a.h_adapter,
+                a.node_count,
+                String::from_utf16_lossy(&buf[..end]),
+                a.name
+            );
+        }
+    }
+
+    #[test]
     fn adapters_enumerate() {
         let m = GpuMonitor::new();
         assert!(!m.adapters.is_empty(), "no adapters found");
@@ -352,6 +387,7 @@ fn enum_adapters() -> Vec<Adapter> {
         if D3DKMTEnumAdapters2(&mut e) != 0 {
             return result;
         }
+        let dxgi_names = dxgi_adapter_names();
         for info in infos.iter().take(e.num_adapters as usize) {
             // Ask the adapter how many engine nodes / memory segments it has.
             let mut q = zeroed_stats();
@@ -363,7 +399,18 @@ fn enum_adapters() -> Vec<Adapter> {
                 let node_count = (q.result[0] >> 32) as u32; // NodeCount
                 if node_count > 0 && node_count < 256 {
                     let name = adapter_name(info.h_adapter)
+                        .or_else(|| {
+                            dxgi_names
+                                .get(&(info.luid_low, info.luid_high))
+                                .map(|n| std::sync::Arc::from(n.as_str()))
+                        })
                         .unwrap_or_else(|| std::sync::Arc::from("GPU"));
+                    // Multiple identical WARP software adapters add nothing.
+                    if name.contains("Basic Render")
+                        && result.iter().any(|a: &Adapter| a.name == name)
+                    {
+                        continue;
+                    }
                     let engine_names: Vec<String> =
                         (0..node_count).map(|n| node_name(info.h_adapter, n)).collect();
                     // Handle stays open for QueryAdapterInfo calls.
@@ -381,6 +428,70 @@ fn enum_adapters() -> Vec<Adapter> {
         }
     }
     result
+}
+
+/// Adapter names by LUID from DXGI — covers software adapters that have no
+/// registry info (Basic Render Driver etc.). Minimal raw-COM: factory →
+/// EnumAdapters1 → GetDesc1.
+fn dxgi_adapter_names() -> FxHashMap<(u32, u32), String> {
+    #[link(name = "dxgi")]
+    extern "system" {
+        fn CreateDXGIFactory1(riid: *const [u8; 16], out: *mut *mut std::ffi::c_void) -> i32;
+    }
+    // IID_IDXGIFactory1 {770aae78-f26f-4dba-a829-253c83d1b387}
+    const IID_FACTORY1: [u8; 16] = [
+        0x78, 0xae, 0x0a, 0x77, 0x6f, 0xf2, 0xba, 0x4d, 0xa8, 0x29, 0x25, 0x3c, 0x83, 0xd1,
+        0xb3, 0x87,
+    ];
+    let mut out = FxHashMap::default();
+    unsafe {
+        type Unknown = *mut std::ffi::c_void;
+        let mut factory: Unknown = std::ptr::null_mut();
+        let hr = CreateDXGIFactory1(&IID_FACTORY1, &mut factory);
+        if hr < 0 || factory.is_null() {
+            #[cfg(test)]
+            eprintln!("CreateDXGIFactory1 failed: {hr:#010x}");
+            return out;
+        }
+        let vtbl = |obj: Unknown, index: usize| -> usize {
+            *(*(obj as *const *const usize)).add(index)
+        };
+        let release = |obj: Unknown| {
+            let f: extern "system" fn(Unknown) -> u32 = std::mem::transmute(vtbl(obj, 2));
+            f(obj);
+        };
+        // IDXGIFactory1::EnumAdapters1 is vtable slot 12 (3 IUnknown +
+        // 4 IDXGIObject + 5 IDXGIFactory).
+        let enum_adapters1: extern "system" fn(Unknown, u32, *mut Unknown) -> i32 =
+            std::mem::transmute(vtbl(factory, 12));
+        for i in 0..16u32 {
+            let mut adapter: Unknown = std::ptr::null_mut();
+            if enum_adapters1(factory, i, &mut adapter) < 0 || adapter.is_null() {
+                break;
+            }
+            // IDXGIAdapter1::GetDesc1 is vtable slot 10; DXGI_ADAPTER_DESC1:
+            // Description WCHAR[128] @0, LUID @296.
+            let get_desc1: extern "system" fn(Unknown, *mut [u8; 312]) -> i32 =
+                std::mem::transmute(vtbl(adapter, 10));
+            let mut desc = [0u8; 312];
+            if get_desc1(adapter, &mut desc) >= 0 {
+                let name_u16: Vec<u16> = desc[..256]
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .take_while(|&c| c != 0)
+                    .collect();
+                let low = u32::from_le_bytes(desc[296..300].try_into().unwrap());
+                let high = u32::from_le_bytes(desc[300..304].try_into().unwrap());
+                let name = String::from_utf16_lossy(&name_u16).trim().to_string();
+                if !name.is_empty() {
+                    out.insert((low, high), name);
+                }
+            }
+            release(adapter);
+        }
+        release(factory);
+    }
+    out
 }
 
 fn adapter_name(h_adapter: u32) -> Option<std::sync::Arc<str>> {
