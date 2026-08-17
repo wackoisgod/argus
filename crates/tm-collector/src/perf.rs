@@ -43,6 +43,10 @@ pub struct MemDetail {
     pub cached: u64,
     pub paged_pool: u64,
     pub nonpaged_pool: u64,
+    /// Composition (bytes): standby list, modified list, free+zeroed.
+    pub standby: u64,
+    pub modified: u64,
+    pub free: u64,
 }
 
 #[derive(Clone, Default)]
@@ -53,6 +57,9 @@ pub struct NetAdapterStats {
     pub tx_bps: u64,
     pub link_speed: u64,
     pub connected: bool,
+    pub mac: String,
+    pub ipv4: String,
+    pub ipv6: String,
 }
 
 #[derive(Clone, Default)]
@@ -60,9 +67,8 @@ pub struct PerfInfo {
     pub cores: Vec<CoreLoad>,
     pub mem: MemDetail,
     pub adapters: Vec<NetAdapterStats>,
-    /// Per GPU adapter: busiest-engine utilization percent (Task Manager
-    /// semantics).
-    pub gpus: Vec<f32>,
+    pub gpus: Vec<crate::gpu::GpuAdapterPerf>,
+    pub disks: Vec<crate::disk::DiskStats>,
     pub uptime_secs: u64,
     pub cpu_name: String,
     pub cpu_mhz: u32,
@@ -71,6 +77,9 @@ pub struct PerfInfo {
 pub(crate) struct PerfSampler {
     prev_cores: Vec<ProcessorPerf>,
     prev_net: FxHashMap<u64, (u64, u64, Instant)>,
+    ips: FxHashMap<u64, (String, String)>,
+    ips_refreshed: Option<Instant>,
+    disks: crate::disk::DiskMonitor,
     cpu_name: String,
     cpu_mhz: u32,
 }
@@ -81,17 +90,21 @@ impl PerfSampler {
         PerfSampler {
             prev_cores: Vec::new(),
             prev_net: FxHashMap::default(),
+            ips: FxHashMap::default(),
+            ips_refreshed: None,
+            disks: crate::disk::DiskMonitor::new(),
             cpu_name,
             cpu_mhz,
         }
     }
 
-    pub fn sample(&mut self, gpus: Vec<f32>) -> PerfInfo {
+    pub fn sample(&mut self, gpus: Vec<crate::gpu::GpuAdapterPerf>) -> PerfInfo {
         PerfInfo {
             cores: self.sample_cores(),
             mem: sample_memory(),
             adapters: self.sample_net(),
             gpus,
+            disks: self.disks.sample(),
             uptime_secs: unsafe { GetTickCount64() } / 1000,
             cpu_name: self.cpu_name.clone(),
             cpu_mhz: self.cpu_mhz,
@@ -138,6 +151,7 @@ impl PerfSampler {
     }
 
     fn sample_net(&mut self) -> Vec<NetAdapterStats> {
+        self.refresh_ips();
         let mut out = Vec::new();
         unsafe {
             let mut table: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
@@ -165,6 +179,16 @@ impl PerfSampler {
                     .position(|&c| c == 0)
                     .unwrap_or(row.Alias.len());
                 let name = String::from_utf16_lossy(&row.Alias[..name_end]);
+                // Wi-Fi Direct / WAN miniport pseudo-adapters.
+                if name.starts_with("Local Area Connection*") {
+                    continue;
+                }
+                let mac_len = (row.PhysicalAddressLength as usize).min(8);
+                let mac = row.PhysicalAddress[..mac_len]
+                    .iter()
+                    .map(|b| format!("{b:02X}"))
+                    .collect::<Vec<_>>()
+                    .join("-");
                 let (mut rx_bps, mut tx_bps) = (0u64, 0u64);
                 if let Some((prev_in, prev_out, prev_t)) = self.prev_net.get(&luid) {
                     let span = now.duration_since(*prev_t).as_secs_f64();
@@ -177,6 +201,7 @@ impl PerfSampler {
                 }
                 self.prev_net
                     .insert(luid, (row.InOctets, row.OutOctets, now));
+                let (ipv4, ipv6) = self.ips.get(&luid).cloned().unwrap_or_default();
                 out.push(NetAdapterStats {
                     name,
                     luid,
@@ -184,12 +209,82 @@ impl PerfSampler {
                     tx_bps,
                     link_speed: row.ReceiveLinkSpeed,
                     connected: row.MediaConnectState == 1,
+                    mac,
+                    ipv4,
+                    ipv6,
                 });
             }
             FreeMibTable(table as *const c_void);
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
+    }
+
+    /// Refresh the luid → (IPv4, IPv6) map every ~15s.
+    fn refresh_ips(&mut self) {
+        use windows_sys::Win32::NetworkManagement::IpHelper::{
+            GetAdaptersAddresses, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
+            GAA_FLAG_SKIP_MULTICAST, IP_ADAPTER_ADDRESSES_LH,
+        };
+        let stale = self
+            .ips_refreshed
+            .map(|t| t.elapsed().as_secs() >= 15)
+            .unwrap_or(true);
+        if !stale {
+            return;
+        }
+        self.ips_refreshed = Some(Instant::now());
+        unsafe {
+            let flags =
+                GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+            let mut size = 32 * 1024u32;
+            let mut buf: Vec<u8>;
+            loop {
+                buf = vec![0u8; size as usize];
+                let ret = GetAdaptersAddresses(
+                    0, // AF_UNSPEC
+                    flags,
+                    std::ptr::null(),
+                    buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH,
+                    &mut size,
+                );
+                if ret == 111 {
+                    continue; // ERROR_BUFFER_OVERFLOW — size updated
+                }
+                if ret != 0 {
+                    return;
+                }
+                break;
+            }
+            self.ips.clear();
+            let mut cur = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
+            while !cur.is_null() {
+                let adapter = &*cur;
+                let luid = adapter.Luid.Value;
+                let (mut v4, mut v6) = (String::new(), String::new());
+                let mut ua = adapter.FirstUnicastAddress;
+                while !ua.is_null() {
+                    let addr = (*ua).Address.lpSockaddr;
+                    if !addr.is_null() {
+                        let family = *(addr as *const u16);
+                        if family == 2 && v4.is_empty() {
+                            let b = std::slice::from_raw_parts((addr as *const u8).add(4), 4);
+                            v4 = format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3]);
+                        } else if family == 23 && v6.is_empty() {
+                            let b =
+                                std::slice::from_raw_parts((addr as *const u16).add(4), 8);
+                            v6 = (0..8)
+                                .map(|i| format!("{:x}", u16::from_be(b[i])))
+                                .collect::<Vec<_>>()
+                                .join(":");
+                        }
+                    }
+                    ua = (*ua).Next;
+                }
+                self.ips.insert(luid, (v4, v6));
+                cur = adapter.Next;
+            }
+        }
     }
 }
 
@@ -200,7 +295,7 @@ fn sample_memory() -> MemDetail {
         return MemDetail::default();
     }
     let page = info.PageSize as u64;
-    MemDetail {
+    let mut detail = MemDetail {
         in_use: (info.PhysicalTotal - info.PhysicalAvailable) as u64 * page,
         available: info.PhysicalAvailable as u64 * page,
         total: info.PhysicalTotal as u64 * page,
@@ -209,7 +304,38 @@ fn sample_memory() -> MemDetail {
         cached: info.SystemCache as u64 * page,
         paged_pool: info.KernelPaged as u64 * page,
         nonpaged_pool: info.KernelNonpaged as u64 * page,
+        ..Default::default()
+    };
+
+    // Memory list composition (standby/modified/free) — class 80.
+    const SYSTEM_MEMORY_LIST_INFORMATION_CLASS: u32 = 80;
+    #[repr(C)]
+    #[derive(Default)]
+    struct MemoryLists {
+        zero: usize,
+        free: usize,
+        modified: usize,
+        modified_no_write: usize,
+        bad: usize,
+        standby_by_priority: [usize; 8],
+        repurposed_by_priority: [usize; 8],
+        modified_page_file: usize,
     }
+    let mut lists = MemoryLists::default();
+    let status = unsafe {
+        NtQuerySystemInformation(
+            SYSTEM_MEMORY_LIST_INFORMATION_CLASS,
+            &mut lists as *mut _ as *mut c_void,
+            std::mem::size_of::<MemoryLists>() as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    if status >= 0 {
+        detail.standby = lists.standby_by_priority.iter().sum::<usize>() as u64 * page;
+        detail.modified = lists.modified as u64 * page;
+        detail.free = (lists.free + lists.zero) as u64 * page;
+    }
+    detail
 }
 
 fn read_cpu_identity() -> (String, u32) {

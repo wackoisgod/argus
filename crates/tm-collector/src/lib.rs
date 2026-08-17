@@ -6,6 +6,7 @@
 //! Buffers are reused, so steady-state cost is one kernel copy and the
 //! per-process name strings.
 
+mod disk;
 mod enrich;
 mod etw;
 mod gpu;
@@ -15,8 +16,10 @@ mod nt;
 mod perf;
 mod windows_q;
 
+pub use disk::DiskStats;
 pub use enrich::{Enriched, Enricher};
 pub use etw::{EtwMonitor, IoTotals};
+pub use gpu::GpuAdapterPerf;
 pub use nt::RawProcess;
 pub use perf::{CoreLoad, MemDetail, NetAdapterStats, PerfInfo};
 
@@ -272,7 +275,7 @@ impl Sampler {
         let perf = if light {
             PerfInfo::default()
         } else {
-            let gpus = self.gpu.adapter_utilization();
+            let gpus = self.gpu.adapters_perf();
             self.perf.sample(gpus)
         };
 

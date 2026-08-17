@@ -22,12 +22,25 @@ use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATI
 extern "system" {
     fn D3DKMTQueryStatistics(stats: *mut QueryStats) -> i32;
     fn D3DKMTEnumAdapters2(enum_adapters: *mut EnumAdapters2) -> i32;
-    fn D3DKMTCloseAdapter(close: *const CloseAdapter) -> i32;
+    fn D3DKMTQueryAdapterInfo(info: *mut QueryAdapterInfo) -> i32;
 }
 
 const TYPE_ADAPTER: u32 = 0;
+const TYPE_SEGMENT: u32 = 3;
 const TYPE_NODE: u32 = 5;
 const TYPE_PROCESS_NODE: u32 = 6;
+const TYPE_PHYSICAL_ADAPTER: u32 = 10;
+const KMTQAITYPE_ADAPTERREGISTRYINFO: u32 = 8;
+const KMTQAITYPE_NODEMETADATA: u32 = 25;
+
+#[repr(C)]
+struct QueryAdapterInfo {
+    h_adapter: u32,
+    ty: u32,
+    data: *mut std::ffi::c_void,
+    size: u32,
+    _pad: u32,
+}
 
 #[repr(C)]
 struct QueryStats {
@@ -58,15 +71,29 @@ struct EnumAdapters2 {
     adapters: *mut AdapterInfo,
 }
 
-#[repr(C)]
-struct CloseAdapter {
-    h_adapter: u32,
-}
-
 struct Adapter {
+    h_adapter: u32,
     luid_low: u32,
     luid_high: u32,
     node_count: u32,
+    segment_count: u32,
+    name: std::sync::Arc<str>,
+    engine_names: std::sync::Arc<Vec<String>>,
+}
+
+/// One GPU adapter's system-wide state for the Performance tab.
+#[derive(Clone, Default)]
+pub struct GpuAdapterPerf {
+    pub name: std::sync::Arc<str>,
+    pub engine_names: std::sync::Arc<Vec<String>>,
+    pub engine_pcts: Vec<f32>,
+    /// Busiest engine — Task Manager's "GPU %".
+    pub utilization: f32,
+    pub vram_used: u64,
+    pub vram_total: u64,
+    pub shared_used: u64,
+    pub shared_total: u64,
+    pub temperature_c: Option<f32>,
 }
 
 pub struct GpuMonitor {
@@ -104,13 +131,18 @@ impl GpuMonitor {
         }
     }
 
-    /// System-wide utilization per adapter: the busiest engine's percent,
-    /// Task Manager's definition of "GPU %".
-    pub fn adapter_utilization(&mut self) -> Vec<f32> {
+    /// System-wide per-adapter state: per-engine utilization (from NODE
+    /// global running-time deltas), VRAM segment usage, and temperature.
+    pub fn adapters_perf(&mut self) -> Vec<GpuAdapterPerf> {
         let now = std::time::Instant::now();
         let mut out = Vec::with_capacity(self.adapters.len());
         for (ai, adapter) in self.adapters.iter().enumerate() {
-            let mut busiest = 0.0f32;
+            let mut perf = GpuAdapterPerf {
+                name: adapter.name.clone(),
+                engine_names: adapter.engine_names.clone(),
+                engine_pcts: vec![0.0; adapter.node_count as usize],
+                ..Default::default()
+            };
             for node in 0..adapter.node_count {
                 let mut q = zeroed_stats();
                 q.ty = TYPE_NODE;
@@ -126,12 +158,58 @@ impl GpuMonitor {
                 if span > 0.05 && prev_total > 0 {
                     let pct =
                         (total.saturating_sub(prev_total) as f64 / (span * 10_000_000.0)
-                            * 100.0) as f32;
-                    busiest = busiest.max(pct.min(100.0));
+                            * 100.0)
+                            .min(100.0) as f32;
+                    perf.engine_pcts[node as usize] = pct;
+                    perf.utilization = perf.utilization.max(pct);
                 }
                 self.node_prev[ai][node as usize] = (total, now);
             }
-            out.push(busiest);
+            // VRAM: local segments = dedicated, aperture segments = shared.
+            for seg in 0..adapter.segment_count {
+                let mut q = zeroed_stats();
+                q.ty = TYPE_SEGMENT;
+                q.luid_low = adapter.luid_low;
+                q.luid_high = adapter.luid_high;
+                q.query_in[0] = seg;
+                if unsafe { D3DKMTQueryStatistics(&mut q) } != 0 {
+                    continue;
+                }
+                // SEGMENT_INFORMATION: CommitLimit@0, BytesResident@16,
+                // Aperture@40 (u32) — offsets from the SDK header probe.
+                // Some drivers report "unlimited" shared segments as huge
+                // sentinels; treat anything implausible (> 1 PiB) as unknown
+                // and leave it out of the total.
+                const SANE: u64 = 1 << 50;
+                let commit_limit = q.result[0];
+                let resident = q.result[2].min(SANE);
+                let aperture = (q.result[5] & 0xFFFF_FFFF) as u32;
+                let (used, total) = if aperture != 0 {
+                    (&mut perf.shared_used, &mut perf.shared_total)
+                } else {
+                    (&mut perf.vram_used, &mut perf.vram_total)
+                };
+                *used = used.saturating_add(resident);
+                if commit_limit < SANE {
+                    *total = total.saturating_add(commit_limit);
+                }
+            }
+            // Temperature via physical-adapter perf data (deci-Celsius).
+            let mut q = zeroed_stats();
+            q.ty = TYPE_PHYSICAL_ADAPTER;
+            q.luid_low = adapter.luid_low;
+            q.luid_high = adapter.luid_high;
+            q.query_in[0] = 0;
+            if unsafe { D3DKMTQueryStatistics(&mut q) } == 0 {
+                // ADAPTER_PERFDATA at result offset 0; Temperature u32 @56.
+                let temp_deci = (q.result[7] & 0xFFFF_FFFF) as u32;
+                if temp_deci > 0 {
+                    let t = temp_deci as f32 / 10.0;
+                    // Some drivers report milli-C.
+                    perf.temperature_c = Some(if t > 200.0 { t / 100.0 } else { t });
+                }
+            }
+            out.push(perf);
         }
         out
     }
@@ -275,26 +353,92 @@ fn enum_adapters() -> Vec<Adapter> {
             return result;
         }
         for info in infos.iter().take(e.num_adapters as usize) {
-            // Ask the adapter how many engine nodes it has.
+            // Ask the adapter how many engine nodes / memory segments it has.
             let mut q = zeroed_stats();
             q.ty = TYPE_ADAPTER;
             q.luid_low = info.luid_low;
             q.luid_high = info.luid_high;
             if D3DKMTQueryStatistics(&mut q) == 0 {
-                let node_count = (q.result[0] >> 32) as u32; // NodeCount at result+4
+                let segment_count = (q.result[0] & 0xFFFF_FFFF) as u32; // NbSegments
+                let node_count = (q.result[0] >> 32) as u32; // NodeCount
                 if node_count > 0 && node_count < 256 {
+                    let name = adapter_name(info.h_adapter)
+                        .unwrap_or_else(|| std::sync::Arc::from("GPU"));
+                    let engine_names: Vec<String> =
+                        (0..node_count).map(|n| node_name(info.h_adapter, n)).collect();
+                    // Handle stays open for QueryAdapterInfo calls.
                     result.push(Adapter {
+                        h_adapter: info.h_adapter,
                         luid_low: info.luid_low,
                         luid_high: info.luid_high,
                         node_count,
+                        segment_count: segment_count.min(64),
+                        name,
+                        engine_names: std::sync::Arc::new(engine_names),
                     });
                 }
             }
-            let close = CloseAdapter {
-                h_adapter: info.h_adapter,
-            };
-            let _ = D3DKMTCloseAdapter(&close);
         }
     }
     result
+}
+
+fn adapter_name(h_adapter: u32) -> Option<std::sync::Arc<str>> {
+    // D3DKMT_ADAPTERREGISTRYINFO: 4 × WCHAR[MAX_PATH]; AdapterString first.
+    let mut buf = vec![0u16; 1040];
+    let mut q = QueryAdapterInfo {
+        h_adapter,
+        ty: KMTQAITYPE_ADAPTERREGISTRYINFO,
+        data: buf.as_mut_ptr().cast(),
+        size: 2080,
+        _pad: 0,
+    };
+    if unsafe { D3DKMTQueryAdapterInfo(&mut q) } != 0 {
+        return None;
+    }
+    let end = buf[..260].iter().position(|&c| c == 0).unwrap_or(0);
+    if end == 0 {
+        return None;
+    }
+    Some(std::sync::Arc::from(
+        String::from_utf16_lossy(&buf[..end]).trim(),
+    ))
+}
+
+fn node_name(h_adapter: u32, node: u32) -> String {
+    // D3DKMT_NODEMETADATA (78 bytes): NodeOrdinalAndAdapterIndex u32 @0,
+    // EngineType i32 @4, FriendlyName WCHAR[32] @8.
+    let mut buf = [0u8; 78];
+    buf[..4].copy_from_slice(&node.to_le_bytes());
+    let mut q = QueryAdapterInfo {
+        h_adapter,
+        ty: KMTQAITYPE_NODEMETADATA,
+        data: buf.as_mut_ptr().cast(),
+        size: 78,
+        _pad: 0,
+    };
+    if unsafe { D3DKMTQueryAdapterInfo(&mut q) } == 0 {
+        let friendly: Vec<u16> = buf[8..72]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .take_while(|&c| c != 0)
+            .collect();
+        if !friendly.is_empty() {
+            return String::from_utf16_lossy(&friendly);
+        }
+        let engine_type = i32::from_le_bytes(buf[4..8].try_into().unwrap());
+        let name = match engine_type {
+            1 => "3D",
+            2 => "Video Decode",
+            3 => "Video Encode",
+            4 => "Video Processing",
+            5 => "Scene Assembly",
+            6 => "Copy",
+            7 => "Overlay",
+            8 => "Crypto",
+            _ => return format!("Engine {node}"),
+        };
+        return name.to_string();
+    }
+    format!("Engine {node}")
 }

@@ -21,7 +21,12 @@ const MEM_FILL: u32 = 0xcba6f755;
 const GPU_FILL: u32 = 0xa6e3a155;
 const NET_FILL: u32 = 0x94e2d555;
 const NET_TX_FILL: u32 = 0x89b4fa66;
+const DISK_FILL: u32 = 0xf9e2af55;
 const CHART_BG: u32 = 0x14141f;
+const COMP_IN_USE: u32 = 0x89b4fa;
+const COMP_MODIFIED: u32 = 0xf9e2af;
+const COMP_STANDBY: u32 = 0xa6e3a1;
+const COMP_FREE: u32 = 0x45475a;
 
 #[derive(Default, Clone)]
 pub struct Series(pub VecDeque<f32>);
@@ -46,6 +51,7 @@ pub enum Pane {
     Cpu,
     Memory,
     Gpu(usize),
+    Disk(u32),
     Net(u64),
 }
 
@@ -56,6 +62,8 @@ pub struct PerfHistory {
     pub cores: Vec<(Series, Series)>,
     pub mem_pct: Series,
     pub gpus: Vec<Series>,
+    pub gpu_engines: Vec<Vec<Series>>,
+    pub disks: FxHashMap<u32, (Series, Series, Series)>, // active%, read, write
     pub net: FxHashMap<u64, (Series, Series)>,
     pub latest: PerfInfo,
 }
@@ -81,8 +89,20 @@ impl PerfHistory {
                 .push(perf.mem.in_use as f32 / perf.mem.total as f32 * 100.0);
         }
         self.gpus.resize_with(perf.gpus.len(), Default::default);
-        for (i, pct) in perf.gpus.iter().enumerate() {
-            self.gpus[i].push(*pct);
+        self.gpu_engines
+            .resize_with(perf.gpus.len(), Default::default);
+        for (i, gpu) in perf.gpus.iter().enumerate() {
+            self.gpus[i].push(gpu.utilization);
+            self.gpu_engines[i].resize_with(gpu.engine_pcts.len(), Default::default);
+            for (e, pct) in gpu.engine_pcts.iter().enumerate() {
+                self.gpu_engines[i][e].push(*pct);
+            }
+        }
+        for disk in &perf.disks {
+            let entry = self.disks.entry(disk.index).or_default();
+            entry.0.push(disk.active_pct);
+            entry.1.push(disk.read_bps as f32);
+            entry.2.push(disk.write_bps as f32);
         }
         for adapter in &perf.adapters {
             let entry = self.net.entry(adapter.luid).or_default();
@@ -254,15 +274,36 @@ impl TaskManagerApp {
             100.0,
         ));
         for (i, gpu) in h.gpus.iter().enumerate() {
+            let info = perf.gpus.get(i);
+            let name = info
+                .map(|g| g.name.to_string())
+                .unwrap_or_else(|| format!("GPU {i}"));
+            let temp = info
+                .and_then(|g| g.temperature_c)
+                .map(|t| format!("  ·  {t:.0} °C"))
+                .unwrap_or_default();
             cards.push(self.perf_card(
                 cx,
                 Pane::Gpu(i),
                 format!("GPU {i}"),
-                format!("{:.1}%", gpu.latest()),
-                String::new(),
+                name,
+                format!("{:.1}%{temp}", gpu.latest()),
                 vec![(series_vec(gpu), GPU_FILL)],
                 100.0,
             ));
+        }
+        for disk in &perf.disks {
+            if let Some((active, _, _)) = h.disks.get(&disk.index) {
+                cards.push(self.perf_card(
+                    cx,
+                    Pane::Disk(disk.index),
+                    format!("Disk {}", disk.index),
+                    disk.model.clone(),
+                    format!("{:.1}%  ·  {}", active.latest(), fmt_bytes(disk.size_bytes)),
+                    vec![(series_vec(active), DISK_FILL)],
+                    100.0,
+                ));
+            }
         }
         for adapter in &perf.adapters {
             if let Some((rx, tx)) = h.net.get(&adapter.luid) {
@@ -291,6 +332,7 @@ impl TaskManagerApp {
             Pane::Cpu => self.render_cpu_pane(),
             Pane::Memory => self.render_memory_pane(),
             Pane::Gpu(i) => self.render_gpu_pane(i),
+            Pane::Disk(i) => self.render_disk_pane(i),
             Pane::Net(luid) => self.render_net_pane(luid),
         };
 
@@ -396,6 +438,64 @@ impl TaskManagerApp {
     fn render_memory_pane(&self) -> AnyElement {
         let h = &self.history;
         let m = &h.latest.mem;
+        // Composition bar: in-use | modified | standby | free, spanning
+        // physical RAM.
+        let composition: AnyElement = if m.total > 0 && m.standby + m.free > 0 {
+            let in_use = m
+                .total
+                .saturating_sub(m.standby + m.modified + m.free);
+            let seg = |bytes: u64, color: u32| {
+                div()
+                    .h_full()
+                    .w(gpui::relative((bytes as f32 / m.total as f32).min(1.0)))
+                    .bg(rgb(color))
+                    .into_any_element()
+            };
+            let legend = |label: &str, bytes: u64, color: u32| {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .child(div().w(px(10.)).h(px(10.)).rounded(px(2.)).bg(rgb(color)))
+                    .child(
+                        div()
+                            .text_color(rgb(TEXT_DIM))
+                            .text_size(px(11.))
+                            .child(format!("{label} {}", fmt_bytes(bytes))),
+                    )
+                    .into_any_element()
+            };
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(div().text_color(rgb(TEXT_DIM)).child("Memory composition"))
+                .child(
+                    div()
+                        .flex()
+                        .h(px(24.))
+                        .w_full()
+                        .rounded(px(4.))
+                        .overflow_hidden()
+                        .child(seg(in_use, COMP_IN_USE))
+                        .child(seg(m.modified, COMP_MODIFIED))
+                        .child(seg(m.standby, COMP_STANDBY))
+                        .child(seg(m.free, COMP_FREE)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap(px(16.))
+                        .child(legend("In use", in_use, COMP_IN_USE))
+                        .child(legend("Modified", m.modified, COMP_MODIFIED))
+                        .child(legend("Standby", m.standby, COMP_STANDBY))
+                        .child(legend("Free", m.free, COMP_FREE)),
+                )
+                .into_any_element()
+        } else {
+            div().into_any_element()
+        };
         div()
             .id("mem-pane")
             .flex()
@@ -403,7 +503,8 @@ impl TaskManagerApp {
             .gap(px(12.))
             .overflow_y_scroll()
             .child(div().text_color(rgb(TEXT)).text_size(px(16.)).child("Memory"))
-            .child(chart(vec![(series_vec(&h.mem_pct), MEM_FILL)], 100.0, 260.))
+            .child(chart(vec![(series_vec(&h.mem_pct), MEM_FILL)], 100.0, 220.))
+            .child(composition)
             .child(
                 div()
                     .flex()
@@ -427,24 +528,172 @@ impl TaskManagerApp {
             .into_any_element()
     }
 
-    fn render_gpu_pane(&self, index: usize) -> AnyElement {
+    fn render_disk_pane(&self, index: u32) -> AnyElement {
         let h = &self.history;
-        let series = h.gpus.get(index).cloned().unwrap_or_default();
+        let disk = h
+            .latest
+            .disks
+            .iter()
+            .find(|d| d.index == index)
+            .cloned()
+            .unwrap_or_default();
+        let (active, read, write) = h.disks.get(&index).cloned().unwrap_or_default();
+        let peak = read.max().max(write.max()).max(1.0);
         div()
+            .id("disk-pane")
             .flex()
             .flex_col()
             .gap(px(12.))
+            .overflow_y_scroll()
             .child(
                 div()
                     .text_color(rgb(TEXT))
                     .text_size(px(16.))
-                    .child(format!("GPU {index}")),
+                    .child(format!("Disk {} — {}", disk.index, disk.model)),
             )
-            .child(chart(vec![(series_vec(&series), GPU_FILL)], 100.0, 260.))
-            .child(div().flex().flex_wrap().children(vec![stat(
-                "Utilization (busiest engine)",
-                format!("{:.1}%", series.latest()),
-            )]))
+            .child(div().text_color(rgb(TEXT_DIM)).child("Active time"))
+            .child(chart(vec![(series_vec(&active), DISK_FILL)], 100.0, 160.))
+            .child(div().text_color(rgb(TEXT_DIM)).child("Disk transfer rate"))
+            .child(chart(
+                vec![
+                    (series_vec(&read), NET_TX_FILL),
+                    (series_vec(&write), DISK_FILL),
+                ],
+                peak,
+                120.,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .children(vec![
+                        stat("Active time", format!("{:.1}%", active.latest())),
+                        stat("Read speed", crate::fmt_mibs(disk.read_bps)),
+                        stat("Write speed", crate::fmt_mibs(disk.write_bps)),
+                        stat("Capacity", fmt_bytes(disk.size_bytes)),
+                    ]),
+            )
+            .into_any_element()
+    }
+
+    fn render_gpu_pane(&self, index: usize) -> AnyElement {
+        let h = &self.history;
+        let series = h.gpus.get(index).cloned().unwrap_or_default();
+        let info = h.latest.gpus.get(index).cloned().unwrap_or_default();
+        // Engine grid: engines with any recent activity, plus the always-
+        // interesting ones by name; capped so 33-node adapters stay sane.
+        let mut engine_cells: Vec<AnyElement> = Vec::new();
+        if let Some(engines) = h.gpu_engines.get(index) {
+            let mut shown = 0;
+            for (e, hist) in engines.iter().enumerate() {
+                let name = info
+                    .engine_names
+                    .get(e)
+                    .cloned()
+                    .unwrap_or_else(|| format!("Engine {e}"));
+                let interesting = hist.max() > 0.5
+                    || name.contains("3D")
+                    || name.contains("Copy")
+                    || name.contains("Video");
+                if !interesting || shown >= 10 {
+                    continue;
+                }
+                shown += 1;
+                engine_cells.push(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .w(px(220.))
+                        .child(
+                            div()
+                                .flex()
+                                .justify_between()
+                                .text_size(px(11.))
+                                .text_color(rgb(TEXT_DIM))
+                                .child(name)
+                                .child(format!("{:.1}%", hist.latest())),
+                        )
+                        .child(chart(vec![(series_vec(hist), GPU_FILL)], 100.0, 70.))
+                        .into_any_element(),
+                );
+            }
+        }
+        let vram: AnyElement = if info.vram_total > 0 {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(4.))
+                .child(div().text_color(rgb(TEXT_DIM)).child(format!(
+                    "VRAM  {} / {}",
+                    fmt_bytes(info.vram_used),
+                    fmt_bytes(info.vram_total)
+                )))
+                .child(
+                    div()
+                        .h(px(14.))
+                        .w_full()
+                        .rounded(px(3.))
+                        .bg(rgb(CHART_BG))
+                        .child(
+                            div()
+                                .h_full()
+                                .w(gpui::relative(
+                                    (info.vram_used as f32 / info.vram_total as f32)
+                                        .min(1.0),
+                                ))
+                                .rounded(px(3.))
+                                .bg(rgb(0x94e2d5)),
+                        ),
+                )
+                .into_any_element()
+        } else {
+            div().into_any_element()
+        };
+        let mut stats: Vec<AnyElement> = vec![stat(
+            "Utilization (busiest engine)",
+            format!("{:.1}%", series.latest()),
+        )];
+        if info.vram_total > 0 {
+            stats.push(stat(
+                "Dedicated memory",
+                format!(
+                    "{} / {}",
+                    fmt_bytes(info.vram_used),
+                    fmt_bytes(info.vram_total)
+                ),
+            ));
+        }
+        if info.shared_used > 0 {
+            let value = if info.shared_total > 0 {
+                format!(
+                    "{} / {}",
+                    fmt_bytes(info.shared_used),
+                    fmt_bytes(info.shared_total)
+                )
+            } else {
+                fmt_bytes(info.shared_used)
+            };
+            stats.push(stat("Shared memory", value));
+        }
+        if let Some(t) = info.temperature_c {
+            stats.push(stat("Temperature", format!("{t:.0} °C")));
+        }
+        div()
+            .id("gpu-pane")
+            .flex()
+            .flex_col()
+            .gap(px(12.))
+            .overflow_y_scroll()
+            .child(
+                div()
+                    .text_color(rgb(TEXT))
+                    .text_size(px(16.))
+                    .child(info.name.to_string()),
+            )
+            .child(chart(vec![(series_vec(&series), GPU_FILL)], 100.0, 180.))
+            .child(div().flex().flex_wrap().gap(px(8.)).children(engine_cells))
+            .child(vram)
+            .child(div().flex().flex_wrap().children(stats))
             .into_any_element()
     }
 
@@ -506,6 +755,9 @@ impl TaskManagerApp {
                                 "Disconnected".into()
                             },
                         ),
+                        stat("MAC address", adapter.mac.clone()),
+                        stat("IPv4 address", adapter.ipv4.clone()),
+                        stat("IPv6 address", adapter.ipv6.clone()),
                     ]),
             )
             .into_any_element()
