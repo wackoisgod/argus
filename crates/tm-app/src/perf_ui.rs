@@ -16,7 +16,7 @@ use crate::{fmt_mbps, TaskManagerApp, ACCENT, BG_HEADER, TEXT, TEXT_DIM};
 pub const HISTORY: usize = 60;
 
 const CPU_FILL: u32 = 0x89b4fa55;
-const KERNEL_FILL: u32 = 0xf38ba866;
+const KERNEL_LINE: u32 = 0xf38ba8dd;
 const MEM_FILL: u32 = 0xcba6f755;
 const GPU_FILL: u32 = 0xa6e3a155;
 const NET_FILL: u32 = 0x94e2d555;
@@ -124,16 +124,36 @@ impl PerfHistory {
     }
 }
 
-/// Filled-area history chart. Each series is (values, fill color); values are
-/// normalized against `max`. Newest sample hugs the right edge; `offset`
-/// (0..1 of one sample step) slides everything left for continuous scroll,
-/// with the newest value held to the right edge so no gap appears.
-fn chart_with(
-    series: Vec<(Vec<f32>, u32)>,
-    max: f32,
-    height: f32,
-    offset: f32,
-) -> gpui::Div {
+/// One chart series: history values, color, and how to draw it.
+#[derive(Clone)]
+pub struct ChartSeries {
+    values: Vec<f32>,
+    color: u32,
+    /// Stroked line instead of a filled area (e.g. the kernel overlay).
+    stroke: bool,
+}
+
+fn fill(values: Vec<f32>, color: u32) -> ChartSeries {
+    ChartSeries {
+        values,
+        color,
+        stroke: false,
+    }
+}
+
+fn line(values: Vec<f32>, color: u32) -> ChartSeries {
+    ChartSeries {
+        values,
+        color,
+        stroke: true,
+    }
+}
+
+/// History chart. Values normalize against `max`; newest sample hugs the
+/// right edge; `offset` (0..1 of one sample step) slides everything left for
+/// continuous scroll, with the newest value held to the right edge so no gap
+/// appears.
+fn chart_with(series: Vec<ChartSeries>, max: f32, height: f32, offset: f32) -> gpui::Div {
     let max = max.max(1e-6);
     div()
         .w_full()
@@ -151,28 +171,40 @@ fn chart_with(
                     let h = f32::from(bounds.size.height);
                     let x0 = f32::from(bounds.origin.x);
                     let y0 = f32::from(bounds.origin.y);
-                    for (values, color) in &series {
-                        if values.len() < 2 {
+                    for s in &series {
+                        if s.values.len() < 2 {
                             continue;
                         }
-                        let n = values.len();
+                        let n = s.values.len();
                         let step = w / (HISTORY.max(2) - 1) as f32;
                         let start_x = x0 + w - step * (n - 1) as f32 - step * offset;
-                        let mut b = gpui::PathBuilder::fill();
-                        b.move_to(point(px(start_x), px(y0 + h)));
+                        let mut b = if s.stroke {
+                            gpui::PathBuilder::stroke(px(1.5))
+                        } else {
+                            gpui::PathBuilder::fill()
+                        };
                         let mut last_y = y0 + h;
-                        for (i, v) in values.iter().enumerate() {
+                        for (i, v) in s.values.iter().enumerate() {
                             let x = start_x + step * i as f32;
                             let y = y0 + h * (1.0 - (v / max).clamp(0.0, 1.0));
-                            b.line_to(point(px(x), px(y)));
+                            if i == 0 && !s.stroke {
+                                b.move_to(point(px(start_x), px(y0 + h)));
+                            }
+                            if i == 0 && s.stroke {
+                                b.move_to(point(px(x), px(y)));
+                            } else {
+                                b.line_to(point(px(x), px(y)));
+                            }
                             last_y = y;
                         }
                         // Hold the newest value to the right edge.
                         b.line_to(point(px(x0 + w), px(last_y)));
-                        b.line_to(point(px(x0 + w), px(y0 + h)));
-                        b.close();
+                        if !s.stroke {
+                            b.line_to(point(px(x0 + w), px(y0 + h)));
+                            b.close();
+                        }
                         if let Ok(path) = b.build() {
-                            window.paint_path(path, rgba(*color));
+                            window.paint_path(path, rgba(s.color));
                         }
                     }
                 },
@@ -181,7 +213,7 @@ fn chart_with(
         )
 }
 
-fn chart(series: Vec<(Vec<f32>, u32)>, max: f32, height: f32) -> AnyElement {
+fn chart(series: Vec<ChartSeries>, max: f32, height: f32) -> AnyElement {
     chart_with(series, max, height, 0.0).into_any_element()
 }
 
@@ -237,7 +269,7 @@ impl TaskManagerApp {
         &self,
         cx: &mut Context<Self>,
         key: &'static str,
-        series: Vec<(Vec<f32>, u32)>,
+        series: Vec<ChartSeries>,
         max: f32,
         height: f32,
         offset: f32,
@@ -247,7 +279,10 @@ impl TaskManagerApp {
         use std::rc::Rc;
         let geom: Rc<Cell<(f32, f32)>> = Rc::new(Cell::new((0.0, 0.0)));
         let geom_paint = Rc::clone(&geom);
-        let primary: Vec<f32> = series.first().map(|s| s.0.clone()).unwrap_or_default();
+        let primary: Vec<f32> = series
+            .first()
+            .map(|s| s.values.clone())
+            .unwrap_or_default();
         let hovered_frac = match &self.chart_hover {
             Some((k, frac)) if k == key => Some(*frac),
             _ => None,
@@ -348,7 +383,7 @@ impl TaskManagerApp {
         title: String,
         line1: String,
         line2: String,
-        mini: Vec<(Vec<f32>, u32)>,
+        mini: Vec<ChartSeries>,
         mini_max: f32,
     ) -> AnyElement {
         let selected = self.pane == pane;
@@ -410,7 +445,7 @@ impl TaskManagerApp {
             "CPU".into(),
             perf.cpu_name.clone(),
             format!("{:.1}%  ·  {} MHz base", h.cpu_total.latest(), perf.cpu_mhz),
-            vec![(series_vec(&h.cpu_total), CPU_FILL)],
+            vec![fill(series_vec(&h.cpu_total), CPU_FILL)],
             100.0,
         ));
         cards.push(self.perf_card(
@@ -423,7 +458,7 @@ impl TaskManagerApp {
                 fmt_bytes(perf.mem.total)
             ),
             format!("{:.1}%", h.mem_pct.latest()),
-            vec![(series_vec(&h.mem_pct), MEM_FILL)],
+            vec![fill(series_vec(&h.mem_pct), MEM_FILL)],
             100.0,
         ));
         for (i, gpu) in h.gpus.iter().enumerate() {
@@ -441,7 +476,7 @@ impl TaskManagerApp {
                 format!("GPU {i}"),
                 name,
                 format!("{:.1}%{temp}", gpu.latest()),
-                vec![(series_vec(gpu), GPU_FILL)],
+                vec![fill(series_vec(gpu), GPU_FILL)],
                 100.0,
             ));
         }
@@ -453,7 +488,7 @@ impl TaskManagerApp {
                     format!("Disk {}", disk.index),
                     disk.model.clone(),
                     format!("{:.1}%  ·  {}", active.latest(), fmt_bytes(disk.size_bytes)),
-                    vec![(series_vec(active), DISK_FILL)],
+                    vec![fill(series_vec(active), DISK_FILL)],
                     100.0,
                 ));
             }
@@ -472,8 +507,8 @@ impl TaskManagerApp {
                         String::new()
                     },
                     vec![
-                        (series_vec(rx), NET_FILL),
-                        (series_vec(tx), NET_TX_FILL),
+                        fill(series_vec(rx), NET_FILL),
+                        fill(series_vec(tx), NET_TX_FILL),
                     ],
                     peak,
                 ));
@@ -524,11 +559,15 @@ impl TaskManagerApp {
         let core_count = h.cores.len();
         let mut core_cells: Vec<AnyElement> = Vec::new();
         for (i, (total, kernel)) in h.cores.iter().enumerate() {
+            // Auto-scale each cell to its own recent peak (15% floor) so
+            // lightly-loaded cores still show a readable waveform instead of
+            // a sliver pinned to the bottom.
+            let cell_max = total.max().max(15.0);
             core_cells.push(
                 div()
                     .flex()
                     .flex_col()
-                    .w(px(150.))
+                    .w(px(170.))
                     .child(
                         div()
                             .flex()
@@ -541,11 +580,11 @@ impl TaskManagerApp {
                     .child(
                         chart_with(
                             vec![
-                                (series_vec(total), CPU_FILL),
-                                (series_vec(kernel), KERNEL_FILL),
+                                fill(series_vec(total), CPU_FILL),
+                                line(series_vec(kernel), KERNEL_LINE),
                             ],
-                            100.0,
-                            64.,
+                            cell_max,
+                            80.,
                             offset,
                         )
                         .into_any_element(),
@@ -557,8 +596,8 @@ impl TaskManagerApp {
             cx,
             "cpu-main",
             vec![
-                (series_vec(&self.history.cpu_total), CPU_FILL),
-                (series_vec(&self.history.cpu_kernel), KERNEL_FILL),
+                fill(series_vec(&self.history.cpu_total), CPU_FILL),
+                line(series_vec(&self.history.cpu_kernel), KERNEL_LINE),
             ],
             100.0,
             180.,
@@ -602,7 +641,7 @@ impl TaskManagerApp {
         let mem_chart = self.hover_chart(
             cx,
             "mem-main",
-            vec![(series_vec(&self.history.mem_pct), MEM_FILL)],
+            vec![fill(series_vec(&self.history.mem_pct), MEM_FILL)],
             100.0,
             220.,
             self.history.anim_offset(),
@@ -715,7 +754,7 @@ impl TaskManagerApp {
         let active_chart = self.hover_chart(
             cx,
             "disk-active",
-            vec![(series_vec(&active), DISK_FILL)],
+            vec![fill(series_vec(&active), DISK_FILL)],
             100.0,
             160.,
             offset,
@@ -725,8 +764,8 @@ impl TaskManagerApp {
             cx,
             "disk-rate",
             vec![
-                (series_vec(&write), DISK_FILL),
-                (series_vec(&read), NET_TX_FILL),
+                fill(series_vec(&write), DISK_FILL),
+                fill(series_vec(&read), NET_TX_FILL),
             ],
             peak,
             120.,
@@ -768,10 +807,7 @@ impl TaskManagerApp {
         let main_chart = self.hover_chart(
             cx,
             "gpu-main",
-            vec![(
-                series_vec(&self.history.gpus.get(index).cloned().unwrap_or_default()),
-                GPU_FILL,
-            )],
+            vec![fill(series_vec(&self.history.gpus.get(index).cloned().unwrap_or_default()), GPU_FILL)],
             100.0,
             180.,
             offset,
@@ -814,7 +850,7 @@ impl TaskManagerApp {
                                 .child(format!("{:.1}%", hist.latest())),
                         )
                         .child(
-                            chart_with(vec![(series_vec(hist), GPU_FILL)], 100.0, 70., offset)
+                            chart_with(vec![fill(series_vec(hist), GPU_FILL)], 100.0, 70., offset)
                                 .into_any_element(),
                         )
                         .into_any_element(),
@@ -916,8 +952,8 @@ impl TaskManagerApp {
             cx,
             "net-main",
             vec![
-                (series_vec(&rx), NET_FILL),
-                (series_vec(&tx), NET_TX_FILL),
+                fill(series_vec(&rx), NET_FILL),
+                fill(series_vec(&tx), NET_TX_FILL),
             ],
             peak,
             260.,
