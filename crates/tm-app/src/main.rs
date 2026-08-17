@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use futures::StreamExt;
 use gpui::{
     actions, div, px, rgb, size, App, Application, Bounds, ClipboardItem, Context, Entity,
-    SharedString, Window, WindowBounds, WindowOptions,
+    SharedString, Timer, Window, WindowBounds, WindowOptions,
 };
 use gpui::prelude::*;
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -746,6 +746,8 @@ struct TaskManagerApp {
     tab: u8,
     pane: perf_ui::Pane,
     history: perf_ui::PerfHistory,
+    /// Chart the mouse is over and the 0..1 x-fraction, for tooltips.
+    chart_hover: Option<(SharedString, f32)>,
 }
 
 /// True when our main window is minimized. The sampler thread discovers its
@@ -847,6 +849,29 @@ impl TaskManagerApp {
         })
         .detach();
 
+        // Chart scroll animation: ~30fps notifications while the Performance
+        // tab is visible (actual paint rate is governed by the adaptive
+        // vsync layer); near-dormant on the Processes tab.
+        cx.spawn(async move |this, cx| {
+            loop {
+                let mut on_perf_tab = false;
+                if this
+                    .update(cx, |this, cx| {
+                        on_perf_tab = this.tab == 1;
+                        if on_perf_tab {
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                Timer::after(Duration::from_millis(if on_perf_tab { 33 } else { 250 }))
+                    .await;
+            }
+        })
+        .detach();
+
         cx.spawn(async move |this, cx| {
             while let Some(snap) = rx.next().await {
                 let alive = this.update(cx, |this, cx| {
@@ -878,6 +903,7 @@ impl TaskManagerApp {
             tab: 0,
             pane: perf_ui::Pane::Cpu,
             history: perf_ui::PerfHistory::default(),
+            chart_hover: None,
         }
     }
 

@@ -57,6 +57,8 @@ pub enum Pane {
 
 #[derive(Default)]
 pub struct PerfHistory {
+    /// When the newest sample landed — drives sub-second scroll animation.
+    pub last_push: Option<std::time::Instant>,
     pub cpu_total: Series,
     pub cpu_kernel: Series,
     pub cores: Vec<(Series, Series)>,
@@ -110,12 +112,28 @@ impl PerfHistory {
             entry.1.push(adapter.tx_bps as f32);
         }
         self.latest = perf.clone();
+        self.last_push = Some(std::time::Instant::now());
+    }
+
+    /// Fraction of one sample step elapsed since the newest sample: charts
+    /// shift left by this much for continuous scrolling.
+    pub fn anim_offset(&self) -> f32 {
+        self.last_push
+            .map(|t| t.elapsed().as_secs_f32().min(1.0))
+            .unwrap_or(0.0)
     }
 }
 
 /// Filled-area history chart. Each series is (values, fill color); values are
-/// normalized against `max`. Newest sample hugs the right edge.
-fn chart(series: Vec<(Vec<f32>, u32)>, max: f32, height: f32) -> AnyElement {
+/// normalized against `max`. Newest sample hugs the right edge; `offset`
+/// (0..1 of one sample step) slides everything left for continuous scroll,
+/// with the newest value held to the right edge so no gap appears.
+fn chart_with(
+    series: Vec<(Vec<f32>, u32)>,
+    max: f32,
+    height: f32,
+    offset: f32,
+) -> gpui::Div {
     let max = max.max(1e-6);
     div()
         .w_full()
@@ -139,14 +157,18 @@ fn chart(series: Vec<(Vec<f32>, u32)>, max: f32, height: f32) -> AnyElement {
                         }
                         let n = values.len();
                         let step = w / (HISTORY.max(2) - 1) as f32;
-                        let start_x = x0 + w - step * (n - 1) as f32;
+                        let start_x = x0 + w - step * (n - 1) as f32 - step * offset;
                         let mut b = gpui::PathBuilder::fill();
                         b.move_to(point(px(start_x), px(y0 + h)));
+                        let mut last_y = y0 + h;
                         for (i, v) in values.iter().enumerate() {
                             let x = start_x + step * i as f32;
                             let y = y0 + h * (1.0 - (v / max).clamp(0.0, 1.0));
                             b.line_to(point(px(x), px(y)));
+                            last_y = y;
                         }
+                        // Hold the newest value to the right edge.
+                        b.line_to(point(px(x0 + w), px(last_y)));
                         b.line_to(point(px(x0 + w), px(y0 + h)));
                         b.close();
                         if let Ok(path) = b.build() {
@@ -157,7 +179,28 @@ fn chart(series: Vec<(Vec<f32>, u32)>, max: f32, height: f32) -> AnyElement {
             )
             .size_full(),
         )
-        .into_any_element()
+}
+
+fn chart(series: Vec<(Vec<f32>, u32)>, max: f32, height: f32) -> AnyElement {
+    chart_with(series, max, height, 0.0).into_any_element()
+}
+
+/// Value formatting for hover tooltips.
+#[derive(Clone, Copy)]
+pub enum Unit {
+    Percent,
+    Mibs,
+    Mbps,
+}
+
+impl Unit {
+    fn format(self, v: f32) -> String {
+        match self {
+            Unit::Percent => format!("{v:.1}%"),
+            Unit::Mibs => crate::fmt_mibs(v as u64),
+            Unit::Mbps => crate::fmt_mbps(v as u64),
+        }
+    }
 }
 
 fn series_vec(s: &Series) -> Vec<f32> {
@@ -188,6 +231,116 @@ fn fmt_uptime(secs: u64) -> String {
 }
 
 impl TaskManagerApp {
+    /// A pane chart with hover: moving the mouse across it shows the value
+    /// at that point in history, Task Manager style.
+    fn hover_chart(
+        &self,
+        cx: &mut Context<Self>,
+        key: &'static str,
+        series: Vec<(Vec<f32>, u32)>,
+        max: f32,
+        height: f32,
+        offset: f32,
+        unit: Unit,
+    ) -> AnyElement {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let geom: Rc<Cell<(f32, f32)>> = Rc::new(Cell::new((0.0, 0.0)));
+        let geom_paint = Rc::clone(&geom);
+        let primary: Vec<f32> = series.first().map(|s| s.0.clone()).unwrap_or_default();
+        let hovered_frac = match &self.chart_hover {
+            Some((k, frac)) if k == key => Some(*frac),
+            _ => None,
+        };
+        let mut container = div()
+            .id(key)
+            .relative()
+            .w_full()
+            .h(px(height))
+            .child(
+                chart_with(series, max, height, offset)
+                    .absolute()
+                    .top_0()
+                    .left_0(),
+            )
+            .child(
+                // Invisible geometry probe: records where the chart landed.
+                div().absolute().top_0().left_0().size_full().child(
+                    canvas(
+                        move |bounds, _, _| {
+                            geom_paint.set((
+                                f32::from(bounds.origin.x),
+                                f32::from(bounds.size.width),
+                            ));
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .size_full(),
+                ),
+            )
+            .on_mouse_move(cx.listener(move |this, e: &gpui::MouseMoveEvent, _, cx| {
+                let (x0, w) = geom.get();
+                if w > 0.0 {
+                    let frac = (f32::from(e.position.x) - x0) / w;
+                    if (0.0..=1.0).contains(&frac) {
+                        this.chart_hover = Some((key.into(), frac));
+                        cx.notify();
+                    } else if matches!(&this.chart_hover, Some((k, _)) if k == key) {
+                        this.chart_hover = None;
+                        cx.notify();
+                    }
+                }
+            }))
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                if !hovered && matches!(&this.chart_hover, Some((k, _)) if k == key) {
+                    this.chart_hover = None;
+                    cx.notify();
+                }
+            }));
+        if let Some(frac) = hovered_frac {
+            // Map fraction of the window to an index in the (possibly
+            // shorter) series, anchored at the right edge.
+            let slot = (frac * (HISTORY - 1) as f32).round() as usize;
+            let missing = HISTORY.saturating_sub(primary.len());
+            let label = if slot >= missing && !primary.is_empty() {
+                let idx = (slot - missing).min(primary.len() - 1);
+                let ago = HISTORY - 1 - slot;
+                Some(format!(
+                    "{}  ·  {}s ago",
+                    unit.format(primary[idx]),
+                    ago
+                ))
+            } else {
+                None
+            };
+            container = container.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(gpui::relative(frac))
+                    .w(px(1.))
+                    .bg(rgb(0x6c7086)),
+            );
+            if let Some(label) = label {
+                container = container.child(
+                    div()
+                        .absolute()
+                        .top(px(6.))
+                        .left(gpui::relative(frac.min(0.75)))
+                        .px(px(8.))
+                        .py(px(4.))
+                        .rounded(px(4.))
+                        .bg(rgb(0x2a2a3d))
+                        .text_size(px(11.))
+                        .text_color(rgb(TEXT))
+                        .child(label),
+                );
+            }
+        }
+        container.into_any_element()
+    }
+
     fn perf_card(
         &self,
         cx: &mut Context<Self>,
@@ -329,11 +482,11 @@ impl TaskManagerApp {
 
         // ---- Detail pane ----
         let detail: AnyElement = match self.pane {
-            Pane::Cpu => self.render_cpu_pane(),
-            Pane::Memory => self.render_memory_pane(),
-            Pane::Gpu(i) => self.render_gpu_pane(i),
-            Pane::Disk(i) => self.render_disk_pane(i),
-            Pane::Net(luid) => self.render_net_pane(luid),
+            Pane::Cpu => self.render_cpu_pane(cx),
+            Pane::Memory => self.render_memory_pane(cx),
+            Pane::Gpu(i) => self.render_gpu_pane(cx, i),
+            Pane::Disk(i) => self.render_disk_pane(cx, i),
+            Pane::Net(luid) => self.render_net_pane(cx, luid),
         };
 
         div()
@@ -363,10 +516,11 @@ impl TaskManagerApp {
             .into_any_element()
     }
 
-    fn render_cpu_pane(&self) -> AnyElement {
+    fn render_cpu_pane(&self, cx: &mut Context<Self>) -> AnyElement {
         let h = &self.history;
-        let perf = &h.latest;
-        let sys = &self.sys;
+        let offset = h.anim_offset();
+        let perf = h.latest.clone();
+        let sys = self.sys.clone();
         let core_count = h.cores.len();
         let mut core_cells: Vec<AnyElement> = Vec::new();
         for (i, (total, kernel)) in h.cores.iter().enumerate() {
@@ -384,17 +538,33 @@ impl TaskManagerApp {
                             .child(format!("CPU {i}"))
                             .child(format!("{:.0}%", total.latest())),
                     )
-                    .child(chart(
-                        vec![
-                            (series_vec(total), CPU_FILL),
-                            (series_vec(kernel), KERNEL_FILL),
-                        ],
-                        100.0,
-                        64.,
-                    ))
+                    .child(
+                        chart_with(
+                            vec![
+                                (series_vec(total), CPU_FILL),
+                                (series_vec(kernel), KERNEL_FILL),
+                            ],
+                            100.0,
+                            64.,
+                            offset,
+                        )
+                        .into_any_element(),
+                    )
                     .into_any_element(),
             );
         }
+        let main_chart = self.hover_chart(
+            cx,
+            "cpu-main",
+            vec![
+                (series_vec(&self.history.cpu_total), CPU_FILL),
+                (series_vec(&self.history.cpu_kernel), KERNEL_FILL),
+            ],
+            100.0,
+            180.,
+            offset,
+            Unit::Percent,
+        );
         div()
             .id("cpu-pane")
             .flex()
@@ -402,14 +572,7 @@ impl TaskManagerApp {
             .gap(px(12.))
             .overflow_y_scroll()
             .child(div().text_color(rgb(TEXT)).text_size(px(16.)).child(perf.cpu_name.clone()))
-            .child(chart(
-                vec![
-                    (series_vec(&h.cpu_total), CPU_FILL),
-                    (series_vec(&h.cpu_kernel), KERNEL_FILL),
-                ],
-                100.0,
-                180.,
-            ))
+            .child(main_chart)
             .child(
                 div()
                     .flex()
@@ -435,7 +598,16 @@ impl TaskManagerApp {
             .into_any_element()
     }
 
-    fn render_memory_pane(&self) -> AnyElement {
+    fn render_memory_pane(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mem_chart = self.hover_chart(
+            cx,
+            "mem-main",
+            vec![(series_vec(&self.history.mem_pct), MEM_FILL)],
+            100.0,
+            220.,
+            self.history.anim_offset(),
+            Unit::Percent,
+        );
         let h = &self.history;
         let m = &h.latest.mem;
         // Composition bar: in-use | modified | standby | free, spanning
@@ -503,7 +675,7 @@ impl TaskManagerApp {
             .gap(px(12.))
             .overflow_y_scroll()
             .child(div().text_color(rgb(TEXT)).text_size(px(16.)).child("Memory"))
-            .child(chart(vec![(series_vec(&h.mem_pct), MEM_FILL)], 100.0, 220.))
+            .child(mem_chart)
             .child(composition)
             .child(
                 div()
@@ -528,8 +700,9 @@ impl TaskManagerApp {
             .into_any_element()
     }
 
-    fn render_disk_pane(&self, index: u32) -> AnyElement {
+    fn render_disk_pane(&self, cx: &mut Context<Self>, index: u32) -> AnyElement {
         let h = &self.history;
+        let offset = h.anim_offset();
         let disk = h
             .latest
             .disks
@@ -539,6 +712,27 @@ impl TaskManagerApp {
             .unwrap_or_default();
         let (active, read, write) = h.disks.get(&index).cloned().unwrap_or_default();
         let peak = read.max().max(write.max()).max(1.0);
+        let active_chart = self.hover_chart(
+            cx,
+            "disk-active",
+            vec![(series_vec(&active), DISK_FILL)],
+            100.0,
+            160.,
+            offset,
+            Unit::Percent,
+        );
+        let rate_chart = self.hover_chart(
+            cx,
+            "disk-rate",
+            vec![
+                (series_vec(&write), DISK_FILL),
+                (series_vec(&read), NET_TX_FILL),
+            ],
+            peak,
+            120.,
+            offset,
+            Unit::Mibs,
+        );
         div()
             .id("disk-pane")
             .flex()
@@ -552,16 +746,9 @@ impl TaskManagerApp {
                     .child(format!("Disk {} — {}", disk.index, disk.model)),
             )
             .child(div().text_color(rgb(TEXT_DIM)).child("Active time"))
-            .child(chart(vec![(series_vec(&active), DISK_FILL)], 100.0, 160.))
+            .child(active_chart)
             .child(div().text_color(rgb(TEXT_DIM)).child("Disk transfer rate"))
-            .child(chart(
-                vec![
-                    (series_vec(&read), NET_TX_FILL),
-                    (series_vec(&write), DISK_FILL),
-                ],
-                peak,
-                120.,
-            ))
+            .child(rate_chart)
             .child(
                 div()
                     .flex()
@@ -576,7 +763,20 @@ impl TaskManagerApp {
             .into_any_element()
     }
 
-    fn render_gpu_pane(&self, index: usize) -> AnyElement {
+    fn render_gpu_pane(&self, cx: &mut Context<Self>, index: usize) -> AnyElement {
+        let offset = self.history.anim_offset();
+        let main_chart = self.hover_chart(
+            cx,
+            "gpu-main",
+            vec![(
+                series_vec(&self.history.gpus.get(index).cloned().unwrap_or_default()),
+                GPU_FILL,
+            )],
+            100.0,
+            180.,
+            offset,
+            Unit::Percent,
+        );
         let h = &self.history;
         let series = h.gpus.get(index).cloned().unwrap_or_default();
         let info = h.latest.gpus.get(index).cloned().unwrap_or_default();
@@ -613,7 +813,10 @@ impl TaskManagerApp {
                                 .child(name)
                                 .child(format!("{:.1}%", hist.latest())),
                         )
-                        .child(chart(vec![(series_vec(hist), GPU_FILL)], 100.0, 70.))
+                        .child(
+                            chart_with(vec![(series_vec(hist), GPU_FILL)], 100.0, 70., offset)
+                                .into_any_element(),
+                        )
                         .into_any_element(),
                 );
             }
@@ -690,15 +893,16 @@ impl TaskManagerApp {
                     .text_size(px(16.))
                     .child(info.name.to_string()),
             )
-            .child(chart(vec![(series_vec(&series), GPU_FILL)], 100.0, 180.))
+            .child(main_chart)
             .child(div().flex().flex_wrap().gap(px(8.)).children(engine_cells))
             .child(vram)
             .child(div().flex().flex_wrap().children(stats))
             .into_any_element()
     }
 
-    fn render_net_pane(&self, luid: u64) -> AnyElement {
+    fn render_net_pane(&self, cx: &mut Context<Self>, luid: u64) -> AnyElement {
         let h = &self.history;
+        let offset = h.anim_offset();
         let adapter = h
             .latest
             .adapters
@@ -708,6 +912,18 @@ impl TaskManagerApp {
             .unwrap_or_default();
         let (rx, tx) = h.net.get(&luid).cloned().unwrap_or_default();
         let peak = rx.max().max(tx.max()).max(1.0);
+        let main_chart = self.hover_chart(
+            cx,
+            "net-main",
+            vec![
+                (series_vec(&rx), NET_FILL),
+                (series_vec(&tx), NET_TX_FILL),
+            ],
+            peak,
+            260.,
+            offset,
+            Unit::Mbps,
+        );
         div()
             .flex()
             .flex_col()
@@ -728,14 +944,7 @@ impl TaskManagerApp {
                             .child(format!("peak {}", fmt_mbps(peak as u64))),
                     ),
             )
-            .child(chart(
-                vec![
-                    (series_vec(&rx), NET_FILL),
-                    (series_vec(&tx), NET_TX_FILL),
-                ],
-                peak,
-                260.,
-            ))
+            .child(main_chart)
             .child(
                 div()
                     .flex()
