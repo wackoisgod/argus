@@ -748,6 +748,10 @@ struct TaskManagerApp {
     history: perf_ui::PerfHistory,
     /// Chart the mouse is over and the 0..1 x-fraction, for tooltips.
     chart_hover: Option<(SharedString, f32)>,
+    /// CPU pane: per-core grid instead of the overall chart.
+    cpu_per_core: bool,
+    /// Draw the kernel-time line on CPU charts.
+    kernel_on: bool,
 }
 
 /// True when our main window is minimized. The sampler thread discovers its
@@ -904,6 +908,8 @@ impl TaskManagerApp {
             pane: perf_ui::Pane::Cpu,
             history: perf_ui::PerfHistory::default(),
             chart_hover: None,
+            cpu_per_core: false,
+            kernel_on: true,
         }
     }
 
