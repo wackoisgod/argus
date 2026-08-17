@@ -15,6 +15,7 @@ fn main() {
     let mut res = winres::WindowsResource::new();
     res.set("FileDescription", "Argus");
     res.set("ProductName", "Argus");
+    res.set_icon("../../assets/argus.ico");
     if let Err(e) = res.compile() {
         println!("cargo:warning=version resource skipped: {e}");
     }

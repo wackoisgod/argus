@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/argus-collector", "crates/argus"]
+members = ["crates/argus-collector", "crates/argus", "tools/icongen"]
 
 [workspace.package]
 edition = "2021"
