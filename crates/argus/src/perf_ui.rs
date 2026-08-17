@@ -6,7 +6,7 @@
 use std::collections::VecDeque;
 
 use gpui::{
-    canvas, div, point, prelude::*, px, rgb, rgba, AnyElement, Context, SharedString, Window,
+    canvas, div, point, prelude::*, px, rgb, rgba, AnyElement, Context, SharedString,
 };
 use rustc_hash::FxHashMap;
 use argus_collector::{fmt_bytes, PerfInfo, Snapshot};
@@ -18,7 +18,6 @@ pub const HISTORY: usize = 60;
 const CPU_FILL: u32 = 0x89b4fa55;
 const CPU_OUTLINE: u32 = 0x89b4faff;
 const MEM_OUTLINE: u32 = 0xcba6f7ff;
-const GPU_OUTLINE: u32 = 0xa6e3a1ff;
 const DISK_OUTLINE: u32 = 0xf9e2afff;
 const NET_OUTLINE: u32 = 0x94e2d5ff;
 const NET_TX_OUTLINE: u32 = 0x89b4faff;
@@ -71,6 +70,8 @@ pub struct PerfHistory {
     pub mem_pct: Series,
     pub gpus: Vec<Series>,
     pub gpu_engines: Vec<Vec<Series>>,
+    pub gpu_vram: Vec<Series>,
+    pub gpu_temp: Vec<Series>,
     pub disks: FxHashMap<u32, (Series, Series, Series)>, // active%, read, write
     pub net: FxHashMap<u64, (Series, Series)>,
     pub latest: PerfInfo,
@@ -99,11 +100,17 @@ impl PerfHistory {
         self.gpus.resize_with(perf.gpus.len(), Default::default);
         self.gpu_engines
             .resize_with(perf.gpus.len(), Default::default);
+        self.gpu_vram.resize_with(perf.gpus.len(), Default::default);
+        self.gpu_temp.resize_with(perf.gpus.len(), Default::default);
         for (i, gpu) in perf.gpus.iter().enumerate() {
             self.gpus[i].push(gpu.utilization);
             self.gpu_engines[i].resize_with(gpu.engine_pcts.len(), Default::default);
             for (e, pct) in gpu.engine_pcts.iter().enumerate() {
                 self.gpu_engines[i][e].push(*pct);
+            }
+            self.gpu_vram[i].push(gpu.vram_used as f32);
+            if let Some(t) = gpu.temperature_c {
+                self.gpu_temp[i].push(t);
             }
         }
         for disk in &perf.disks {
@@ -186,7 +193,8 @@ fn chart_with(series: Vec<ChartSeries>, max: f32, height: f32, offset: f32) -> g
     let max = max.max(1e-6);
     div()
         .w_full()
-        .h(px(height))
+        .when(height > 0.0, |d| d.h(px(height)))
+        .when(height <= 0.0, |d| d.h_full())
         .bg(rgb(CHART_BG))
         .border_1()
         .border_color(rgb(0x2a2a3d))
@@ -269,6 +277,8 @@ pub enum Unit {
     Percent,
     Mibs,
     Mbps,
+    Bytes,
+    Celsius,
 }
 
 impl Unit {
@@ -277,6 +287,8 @@ impl Unit {
             Unit::Percent => format!("{v:.1}%"),
             Unit::Mibs => crate::fmt_mibs(v as u64),
             Unit::Mbps => crate::fmt_mbps(v as u64),
+            Unit::Bytes => fmt_bytes(v as u64),
+            Unit::Celsius => format!("{v:.0} °C"),
         }
     }
 }
@@ -311,7 +323,10 @@ fn fmt_uptime(secs: u64) -> String {
 impl TaskManagerApp {
     /// A pane chart with hover: moving the mouse across it shows the value
     /// at that point in history, Task Manager style.
-    fn hover_chart(
+    /// `flex` makes the chart grow to fill remaining pane height (with
+    /// `height` as the minimum) instead of being fixed.
+    #[allow(clippy::too_many_arguments)]
+    fn hover_chart_sized(
         &self,
         cx: &mut Context<Self>,
         key: SharedString,
@@ -319,6 +334,7 @@ impl TaskManagerApp {
         series: Vec<ChartSeries>,
         max: f32,
         height: f32,
+        flex: bool,
         offset: f32,
         unit: Unit,
     ) -> AnyElement {
@@ -340,9 +356,10 @@ impl TaskManagerApp {
             .id(key.clone())
             .relative()
             .w_full()
-            .h(px(height))
+            .when(!flex, |d| d.h(px(height)))
+            .when(flex, |d| d.flex_1().min_h(px(height)))
             .child(
-                chart_with(series, max, height, offset)
+                chart_with(series, max, if flex { -1.0 } else { height }, offset)
                     .absolute()
                     .top_0()
                     .left_0(),
@@ -425,6 +442,38 @@ impl TaskManagerApp {
             }
         }
         container.into_any_element()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn hover_chart(
+        &self,
+        cx: &mut Context<Self>,
+        key: SharedString,
+        label: &'static str,
+        series: Vec<ChartSeries>,
+        max: f32,
+        height: f32,
+        offset: f32,
+        unit: Unit,
+    ) -> AnyElement {
+        self.hover_chart_sized(cx, key, label, series, max, height, false, offset, unit)
+    }
+
+    /// A hover chart that grows to fill the pane's remaining height,
+    /// Task Manager style — `min_height` keeps it usable in short windows.
+    #[allow(clippy::too_many_arguments)]
+    fn hover_chart_flex(
+        &self,
+        cx: &mut Context<Self>,
+        key: SharedString,
+        label: &'static str,
+        series: Vec<ChartSeries>,
+        max: f32,
+        min_height: f32,
+        offset: f32,
+        unit: Unit,
+    ) -> AnyElement {
+        self.hover_chart_sized(cx, key, label, series, max, min_height, true, offset, unit)
     }
 
     fn perf_card(
@@ -665,7 +714,8 @@ impl TaskManagerApp {
                     )),
             );
 
-        let body: AnyElement = if self.cpu_per_core {
+        let per_core = self.cpu_per_core;
+        let body: AnyElement = if per_core {
             // Tall fixed-scale cells like the reference; each one hoverable.
             let mut core_cells: Vec<AnyElement> = Vec::new();
             for (i, (total, kernel)) in h.cores.iter().enumerate() {
@@ -720,13 +770,13 @@ impl TaskManagerApp {
             if kernel_on {
                 series.push(line(series_vec(&h.cpu_kernel), KERNEL_LINE));
             }
-            self.hover_chart(
+            self.hover_chart_flex(
                 cx,
                 "cpu-main".into(),
                 "Total",
                 series,
                 100.0,
-                480.,
+                200.,
                 offset,
                 Unit::Percent,
             )
@@ -736,8 +786,10 @@ impl TaskManagerApp {
             .id("cpu-pane")
             .flex()
             .flex_col()
+            .flex_1()
+            .min_h(px(0.))
             .gap(px(12.))
-            .overflow_y_scroll()
+            .when(per_core, |d| d.overflow_y_scroll())
             .child(header)
             .child(body)
             .child(
@@ -759,7 +811,7 @@ impl TaskManagerApp {
     }
 
     fn render_memory_pane(&self, cx: &mut Context<Self>) -> AnyElement {
-        let mem_chart = self.hover_chart(
+        let mem_chart = self.hover_chart_flex(
             cx,
             "mem-main".into(),
             "In use",
@@ -769,7 +821,7 @@ impl TaskManagerApp {
                 MEM_OUTLINE,
             )],
             100.0,
-            220.,
+            200.,
             self.history.anim_offset(),
             Unit::Percent,
         );
@@ -837,8 +889,9 @@ impl TaskManagerApp {
             .id("mem-pane")
             .flex()
             .flex_col()
+            .flex_1()
+            .min_h(px(0.))
             .gap(px(12.))
-            .overflow_y_scroll()
             .child(div().text_color(rgb(TEXT)).text_size(px(16.)).child("Memory"))
             .child(mem_chart)
             .child(composition)
@@ -877,17 +930,17 @@ impl TaskManagerApp {
             .unwrap_or_default();
         let (active, read, write) = h.disks.get(&index).cloned().unwrap_or_default();
         let peak = read.max().max(write.max()).max(1.0);
-        let active_chart = self.hover_chart(
+        let active_chart = self.hover_chart_flex(
             cx,
             "disk-active".into(),
             "Active",
             vec![fill_outlined(series_vec(&active), DISK_FILL, DISK_OUTLINE)],
             100.0,
-            160.,
+            140.,
             offset,
             Unit::Percent,
         );
-        let rate_chart = self.hover_chart(
+        let rate_chart = self.hover_chart_flex(
             cx,
             "disk-rate".into(),
             "Write",
@@ -904,8 +957,9 @@ impl TaskManagerApp {
             .id("disk-pane")
             .flex()
             .flex_col()
+            .flex_1()
+            .min_h(px(0.))
             .gap(px(12.))
-            .overflow_y_scroll()
             .child(
                 div()
                     .text_color(rgb(TEXT))
@@ -931,48 +985,45 @@ impl TaskManagerApp {
     }
 
     fn render_gpu_pane(&self, cx: &mut Context<Self>, index: usize) -> AnyElement {
-        let offset = self.history.anim_offset();
-        let main_chart = self.hover_chart(
-            cx,
-            "gpu-main".into(),
-            "Utilization",
-            vec![fill_outlined(
-                series_vec(&self.history.gpus.get(index).cloned().unwrap_or_default()),
-                GPU_FILL,
-                GPU_OUTLINE,
-            )],
-            100.0,
-            180.,
-            offset,
-            Unit::Percent,
-        );
         let h = &self.history;
+        let offset = h.anim_offset();
         let series = h.gpus.get(index).cloned().unwrap_or_default();
         let info = h.latest.gpus.get(index).cloned().unwrap_or_default();
-        // Engine grid: engines with any recent activity, plus the always-
-        // interesting ones by name; capped so 33-node adapters stay sane.
+        // Reference layout: a two-column grid of equal engine charts is the
+        // main content — idle engines included — then full-width VRAM and
+        // temperature history, then the detail stats.
+        const ENGINE_COLORS: [u32; 8] = [
+            0xa6e3a1, 0x89b4fa, 0xcba6f7, 0xf9e2af, 0x94e2d5, 0xf38ba8, 0xfab387, 0xb4befe,
+        ];
         let mut engine_cells: Vec<AnyElement> = Vec::new();
         if let Some(engines) = h.gpu_engines.get(index) {
-            let mut shown = 0;
-            for (e, hist) in engines.iter().enumerate() {
+            for (e, hist) in engines.iter().enumerate().take(12) {
                 let name = info
                     .engine_names
                     .get(e)
                     .cloned()
                     .unwrap_or_else(|| format!("Engine {e}"));
-                let interesting = hist.max() > 0.5
-                    || name.contains("3D")
-                    || name.contains("Copy")
-                    || name.contains("Video");
-                if !interesting || shown >= 10 {
-                    continue;
-                }
-                shown += 1;
+                let base = ENGINE_COLORS[e % ENGINE_COLORS.len()];
+                let cell_chart = self.hover_chart(
+                    cx,
+                    format!("gpu{index}-eng{e}").into(),
+                    "Utilization",
+                    vec![fill_outlined(
+                        series_vec(hist),
+                        base << 8 | 0x55,
+                        base << 8 | 0xff,
+                    )],
+                    100.0,
+                    170.,
+                    offset,
+                    Unit::Percent,
+                );
                 engine_cells.push(
                     div()
                         .flex()
                         .flex_col()
-                        .w(px(220.))
+                        .flex_1()
+                        .min_w(px(0.))
                         .child(
                             div()
                                 .flex()
@@ -982,41 +1033,83 @@ impl TaskManagerApp {
                                 .child(name)
                                 .child(format!("{:.1}%", hist.latest())),
                         )
-                        .child(
-                            chart_with(vec![fill(series_vec(hist), GPU_FILL)], 100.0, 70., offset)
-                                .into_any_element(),
-                        )
+                        .child(cell_chart)
                         .into_any_element(),
                 );
             }
         }
-        let vram: AnyElement = if info.vram_total > 0 {
+        let mut rows: Vec<AnyElement> = Vec::new();
+        let mut iter = engine_cells.into_iter().peekable();
+        while iter.peek().is_some() {
+            let mut row = div().flex().gap(px(8.)).w_full();
+            for _ in 0..2 {
+                if let Some(cell) = iter.next() {
+                    row = row.child(cell);
+                } else {
+                    row = row.child(div().flex_1());
+                }
+            }
+            rows.push(row.into_any_element());
+        }
+        let vram_chart: AnyElement = if info.vram_total > 0 {
             div()
                 .flex()
                 .flex_col()
-                .gap(px(4.))
-                .child(div().text_color(rgb(TEXT_DIM)).child(format!(
-                    "VRAM  {} / {}",
-                    fmt_bytes(info.vram_used),
-                    fmt_bytes(info.vram_total)
-                )))
                 .child(
                     div()
-                        .h(px(14.))
-                        .w_full()
-                        .rounded(px(3.))
-                        .bg(rgb(CHART_BG))
-                        .child(
-                            div()
-                                .h_full()
-                                .w(gpui::relative(
-                                    (info.vram_used as f32 / info.vram_total as f32)
-                                        .min(1.0),
-                                ))
-                                .rounded(px(3.))
-                                .bg(rgb(0x94e2d5)),
-                        ),
+                        .flex()
+                        .justify_between()
+                        .text_size(px(11.))
+                        .text_color(rgb(TEXT_DIM))
+                        .child("VRAM")
+                        .child(format!(
+                            "{} / {}",
+                            fmt_bytes(info.vram_used),
+                            fmt_bytes(info.vram_total)
+                        )),
                 )
+                .child(self.hover_chart(
+                    cx,
+                    format!("gpu{index}-vram").into(),
+                    "VRAM",
+                    vec![fill_outlined(
+                        series_vec(&h.gpu_vram.get(index).cloned().unwrap_or_default()),
+                        NET_FILL,
+                        NET_OUTLINE,
+                    )],
+                    info.vram_total as f32,
+                    70.,
+                    offset,
+                    Unit::Bytes,
+                ))
+                .into_any_element()
+        } else {
+            div().into_any_element()
+        };
+        let temp_series = h.gpu_temp.get(index).cloned().unwrap_or_default();
+        let temp_chart: AnyElement = if !temp_series.0.is_empty() {
+            div()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .flex()
+                        .justify_between()
+                        .text_size(px(11.))
+                        .text_color(rgb(TEXT_DIM))
+                        .child("GPU temperature")
+                        .child(format!("{:.0} °C", temp_series.latest())),
+                )
+                .child(self.hover_chart(
+                    cx,
+                    format!("gpu{index}-temp").into(),
+                    "Temperature",
+                    vec![fill_outlined(series_vec(&temp_series), 0xfab38755, 0xfab387ff)],
+                    100.0,
+                    70.,
+                    offset,
+                    Unit::Celsius,
+                ))
                 .into_any_element()
         } else {
             div().into_any_element()
@@ -1025,35 +1118,32 @@ impl TaskManagerApp {
             "Utilization (busiest engine)",
             format!("{:.1}%", series.latest()),
         )];
-        if info.vram_total > 0 {
-            stats.push(stat(
-                "Dedicated memory",
-                format!(
-                    "{} / {}",
-                    fmt_bytes(info.vram_used),
-                    fmt_bytes(info.vram_total)
-                ),
-            ));
-        }
-        if info.shared_used > 0 {
-            let value = if info.shared_total > 0 {
-                format!(
-                    "{} / {}",
-                    fmt_bytes(info.shared_used),
-                    fmt_bytes(info.shared_total)
-                )
-            } else {
-                fmt_bytes(info.shared_used)
-            };
-            stats.push(stat("Shared memory", value));
-        }
         if let Some(t) = info.temperature_c {
             stats.push(stat("Temperature", format!("{t:.0} °C")));
         }
+        if info.vram_total > 0 {
+            stats.push(stat("GPU memory (dedicated)", fmt_bytes(info.vram_total)));
+            stats.push(stat("Dedicated in use", fmt_bytes(info.vram_used)));
+        }
+        if info.shared_used > 0 {
+            stats.push(stat("Shared in use", fmt_bytes(info.shared_used)));
+        }
+        if !info.driver_version.is_empty() {
+            stats.push(stat("Driver version", info.driver_version.to_string()));
+        }
+        if !info.driver_date.is_empty() {
+            stats.push(stat("Driver date", info.driver_date.to_string()));
+        }
+        stats.push(stat(
+            "Physical location",
+            format!("Adapter LUID {:08X}:{:08X}", info.luid_high, info.luid_low),
+        ));
         div()
             .id("gpu-pane")
             .flex()
             .flex_col()
+            .flex_1()
+            .min_h(px(0.))
             .gap(px(12.))
             .overflow_y_scroll()
             .child(
@@ -1062,9 +1152,9 @@ impl TaskManagerApp {
                     .text_size(px(16.))
                     .child(info.name.to_string()),
             )
-            .child(main_chart)
-            .child(div().flex().flex_wrap().gap(px(8.)).children(engine_cells))
-            .child(vram)
+            .children(rows)
+            .child(vram_chart)
+            .child(temp_chart)
             .child(div().flex().flex_wrap().children(stats))
             .into_any_element()
     }
@@ -1081,7 +1171,7 @@ impl TaskManagerApp {
             .unwrap_or_default();
         let (rx, tx) = h.net.get(&luid).cloned().unwrap_or_default();
         let peak = rx.max().max(tx.max()).max(1.0);
-        let main_chart = self.hover_chart(
+        let main_chart = self.hover_chart_flex(
             cx,
             "net-main".into(),
             "Receive",
@@ -1090,13 +1180,15 @@ impl TaskManagerApp {
                 fill_outlined(series_vec(&tx), NET_TX_FILL, NET_TX_OUTLINE),
             ],
             peak,
-            260.,
+            200.,
             offset,
             Unit::Mbps,
         );
         div()
             .flex()
             .flex_col()
+            .flex_1()
+            .min_h(px(0.))
             .gap(px(12.))
             .child(
                 div()

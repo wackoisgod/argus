@@ -79,6 +79,8 @@ struct Adapter {
     segment_count: u32,
     name: std::sync::Arc<str>,
     engine_names: std::sync::Arc<Vec<String>>,
+    driver_version: std::sync::Arc<str>,
+    driver_date: std::sync::Arc<str>,
 }
 
 /// One GPU adapter's system-wide state for the Performance tab.
@@ -94,6 +96,10 @@ pub struct GpuAdapterPerf {
     pub shared_used: u64,
     pub shared_total: u64,
     pub temperature_c: Option<f32>,
+    pub luid_low: u32,
+    pub luid_high: u32,
+    pub driver_version: std::sync::Arc<str>,
+    pub driver_date: std::sync::Arc<str>,
 }
 
 pub struct GpuMonitor {
@@ -154,6 +160,10 @@ impl GpuMonitor {
                 name: adapter.name.clone(),
                 engine_names: adapter.engine_names.clone(),
                 engine_pcts: vec![0.0; adapter.node_count as usize],
+                luid_low: adapter.luid_low,
+                luid_high: adapter.luid_high,
+                driver_version: adapter.driver_version.clone(),
+                driver_date: adapter.driver_date.clone(),
                 ..Default::default()
             };
             for node in 0..adapter.node_count {
@@ -443,6 +453,7 @@ fn enum_adapters() -> Vec<Adapter> {
                     }
                     let engine_names: Vec<String> =
                         (0..node_count).map(|n| node_name(info.h_adapter, n)).collect();
+                    let (driver_version, driver_date) = driver_info(&name);
                     // Handle stays open for QueryAdapterInfo calls.
                     result.push(Adapter {
                         h_adapter: info.h_adapter,
@@ -452,12 +463,58 @@ fn enum_adapters() -> Vec<Adapter> {
                         segment_count: segment_count.min(64),
                         name,
                         engine_names: std::sync::Arc::new(engine_names),
+                        driver_version,
+                        driver_date,
                     });
                 }
             }
         }
     }
     result
+}
+
+/// Display driver version and date from the display-class registry key,
+/// matched by DriverDesc. Empty strings when no instance matches (software
+/// adapters). One-time cost at adapter enumeration.
+fn driver_info(adapter_name: &str) -> (std::sync::Arc<str>, std::sync::Arc<str>) {
+    use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_ANY};
+    let read = |subkey: &str, value: &str| -> Option<String> {
+        let key: Vec<u16> = subkey.encode_utf16().chain([0]).collect();
+        let val: Vec<u16> = value.encode_utf16().chain([0]).collect();
+        let mut buf = [0u16; 256];
+        let mut size = (buf.len() * 2) as u32;
+        let ok = unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                key.as_ptr(),
+                val.as_ptr(),
+                RRF_RT_ANY,
+                std::ptr::null_mut(),
+                buf.as_mut_ptr() as *mut std::ffi::c_void,
+                &mut size,
+            )
+        } == 0;
+        if !ok {
+            return None;
+        }
+        let end = buf.iter().position(|&c| c == 0).unwrap_or(0);
+        Some(String::from_utf16_lossy(&buf[..end]).trim().to_string())
+    };
+    const CLASS: &str =
+        "SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}";
+    for i in 0..16 {
+        let subkey = format!("{CLASS}\\{i:04}");
+        match read(&subkey, "DriverDesc") {
+            Some(desc) if desc == adapter_name => {
+                let version = read(&subkey, "DriverVersion").unwrap_or_default();
+                let date = read(&subkey, "DriverDate").unwrap_or_default();
+                return (version.into(), date.into());
+            }
+            Some(_) => continue,
+            None => break,
+        }
+    }
+    (std::sync::Arc::from(""), std::sync::Arc::from(""))
 }
 
 /// Adapter names by LUID from DXGI — covers software adapters that have no
