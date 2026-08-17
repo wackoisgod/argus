@@ -104,9 +104,16 @@ pub struct GpuMonitor {
     prev: FxHashMap<(u32, i64), (u64, std::time::Instant)>,
     /// Pids that showed GPU time recently — polled every tick.
     active: FxHashSet<u32>,
-    /// Global per-(adapter, node) running time + timestamp, for adapter
-    /// utilization (busiest engine).
-    node_prev: Vec<Vec<(u64, std::time::Instant)>>,
+    /// Global per-(adapter, node) running time + timestamp + recently-active
+    /// flag, for adapter utilization (busiest engine). Every QueryStatistics
+    /// call can stall in the driver, so idle engines poll at reduced rate.
+    node_prev: Vec<Vec<(u64, std::time::Instant, bool)>>,
+    /// Cached (vram_used, vram_total, shared_used, shared_total, temp) per
+    /// adapter. The segment and physical-adapter queries make the AMD
+    /// driver stall the CPU polling hardware (~9ms), so they refresh every
+    /// few ticks instead of every second.
+    mem_temp_cache: Vec<(u64, u64, u64, u64, Option<f32>)>,
+    perf_tick: u32,
     tick: u32,
 }
 
@@ -120,13 +127,16 @@ impl GpuMonitor {
         let adapters = enum_adapters();
         let node_prev = adapters
             .iter()
-            .map(|a| vec![(0u64, std::time::Instant::now()); a.node_count as usize])
+            .map(|a| vec![(0u64, std::time::Instant::now(), true); a.node_count as usize])
             .collect();
+        let adapter_count = adapters.len();
         GpuMonitor {
             adapters,
             prev: FxHashMap::default(),
             active: FxHashSet::default(),
             node_prev,
+            mem_temp_cache: vec![(0, 0, 0, 0, None); adapter_count],
+            perf_tick: 0,
             tick: 0,
         }
     }
@@ -135,6 +145,9 @@ impl GpuMonitor {
     /// global running-time deltas), VRAM segment usage, and temperature.
     pub fn adapters_perf(&mut self) -> Vec<GpuAdapterPerf> {
         let now = std::time::Instant::now();
+        self.perf_tick = self.perf_tick.wrapping_add(1);
+        // Hardware-polling queries (segments, temperature) every 5th tick.
+        let refresh_hw = self.perf_tick % 5 == 1;
         let mut out = Vec::with_capacity(self.adapters.len());
         for (ai, adapter) in self.adapters.iter().enumerate() {
             let mut perf = GpuAdapterPerf {
@@ -144,6 +157,12 @@ impl GpuMonitor {
                 ..Default::default()
             };
             for node in 0..adapter.node_count {
+                let (prev_total, prev_at, was_active) = self.node_prev[ai][node as usize];
+                // Idle engines poll every 5th tick to limit driver stalls.
+                let probe = was_active || (self.perf_tick + node) % 5 == 0;
+                if !probe {
+                    continue;
+                }
                 let mut q = zeroed_stats();
                 q.ty = TYPE_NODE;
                 q.luid_low = adapter.luid_low;
@@ -153,8 +172,8 @@ impl GpuMonitor {
                     continue;
                 }
                 let total = q.result[0]; // GlobalInformation.RunningTime
-                let (prev_total, prev_at) = self.node_prev[ai][node as usize];
                 let span = now.duration_since(prev_at).as_secs_f64();
+                let mut active = false;
                 if span > 0.05 && prev_total > 0 {
                     let pct =
                         (total.saturating_sub(prev_total) as f64 / (span * 10_000_000.0)
@@ -162,53 +181,63 @@ impl GpuMonitor {
                             .min(100.0) as f32;
                     perf.engine_pcts[node as usize] = pct;
                     perf.utilization = perf.utilization.max(pct);
+                    active = pct > 0.1;
                 }
-                self.node_prev[ai][node as usize] = (total, now);
+                self.node_prev[ai][node as usize] = (total, now, active);
             }
-            // VRAM: local segments = dedicated, aperture segments = shared.
-            for seg in 0..adapter.segment_count {
+            if refresh_hw {
+                let mut cache = (0u64, 0u64, 0u64, 0u64, None);
+                // VRAM: local segments = dedicated, aperture segments =
+                // shared.
+                for seg in 0..adapter.segment_count {
+                    let mut q = zeroed_stats();
+                    q.ty = TYPE_SEGMENT;
+                    q.luid_low = adapter.luid_low;
+                    q.luid_high = adapter.luid_high;
+                    q.query_in[0] = seg;
+                    if unsafe { D3DKMTQueryStatistics(&mut q) } != 0 {
+                        continue;
+                    }
+                    // SEGMENT_INFORMATION: CommitLimit@0, BytesResident@16,
+                    // Aperture@40 (u32) — offsets from the SDK header probe.
+                    // "Unlimited" shared segments report huge sentinel
+                    // limits; leave those out of the total.
+                    const SANE: u64 = 1 << 50;
+                    let commit_limit = q.result[0];
+                    let resident = q.result[2].min(SANE);
+                    let aperture = (q.result[5] & 0xFFFF_FFFF) as u32;
+                    let (used, total) = if aperture != 0 {
+                        (&mut cache.2, &mut cache.3)
+                    } else {
+                        (&mut cache.0, &mut cache.1)
+                    };
+                    *used = used.saturating_add(resident);
+                    if commit_limit < SANE {
+                        *total = total.saturating_add(commit_limit);
+                    }
+                }
+                // Temperature via physical-adapter perf data (deci-Celsius).
                 let mut q = zeroed_stats();
-                q.ty = TYPE_SEGMENT;
+                q.ty = TYPE_PHYSICAL_ADAPTER;
                 q.luid_low = adapter.luid_low;
                 q.luid_high = adapter.luid_high;
-                q.query_in[0] = seg;
-                if unsafe { D3DKMTQueryStatistics(&mut q) } != 0 {
-                    continue;
+                q.query_in[0] = 0;
+                if unsafe { D3DKMTQueryStatistics(&mut q) } == 0 {
+                    // ADAPTER_PERFDATA at result offset 0; Temperature @56.
+                    let temp_deci = (q.result[7] & 0xFFFF_FFFF) as u32;
+                    if temp_deci > 0 {
+                        let t = temp_deci as f32 / 10.0;
+                        cache.4 = Some(if t > 200.0 { t / 100.0 } else { t });
+                    }
                 }
-                // SEGMENT_INFORMATION: CommitLimit@0, BytesResident@16,
-                // Aperture@40 (u32) — offsets from the SDK header probe.
-                // Some drivers report "unlimited" shared segments as huge
-                // sentinels; treat anything implausible (> 1 PiB) as unknown
-                // and leave it out of the total.
-                const SANE: u64 = 1 << 50;
-                let commit_limit = q.result[0];
-                let resident = q.result[2].min(SANE);
-                let aperture = (q.result[5] & 0xFFFF_FFFF) as u32;
-                let (used, total) = if aperture != 0 {
-                    (&mut perf.shared_used, &mut perf.shared_total)
-                } else {
-                    (&mut perf.vram_used, &mut perf.vram_total)
-                };
-                *used = used.saturating_add(resident);
-                if commit_limit < SANE {
-                    *total = total.saturating_add(commit_limit);
-                }
+                self.mem_temp_cache[ai] = cache;
             }
-            // Temperature via physical-adapter perf data (deci-Celsius).
-            let mut q = zeroed_stats();
-            q.ty = TYPE_PHYSICAL_ADAPTER;
-            q.luid_low = adapter.luid_low;
-            q.luid_high = adapter.luid_high;
-            q.query_in[0] = 0;
-            if unsafe { D3DKMTQueryStatistics(&mut q) } == 0 {
-                // ADAPTER_PERFDATA at result offset 0; Temperature u32 @56.
-                let temp_deci = (q.result[7] & 0xFFFF_FFFF) as u32;
-                if temp_deci > 0 {
-                    let t = temp_deci as f32 / 10.0;
-                    // Some drivers report milli-C.
-                    perf.temperature_c = Some(if t > 200.0 { t / 100.0 } else { t });
-                }
-            }
+            let (vu, vt, su, st, temp) = self.mem_temp_cache[ai];
+            perf.vram_used = vu;
+            perf.vram_total = vt;
+            perf.shared_used = su;
+            perf.shared_total = st;
+            perf.temperature_c = temp;
             out.push(perf);
         }
         out
