@@ -6,12 +6,8 @@
 use std::collections::VecDeque;
 
 use gpui::{
-    canvas, div, linear_color_stop, linear_gradient, prelude::*, px, rgb, rgba, AnyElement,
-    Context, SharedString,
-};
-use gpui_component::plot::{
-    shape::{Area, Line as PlotLine},
-    StrokeStyle,
+    canvas, div, linear_color_stop, linear_gradient, point, prelude::*, px, rgb, rgba,
+    AnyElement, Context, SharedString,
 };
 use rustc_hash::FxHashMap;
 use argus_collector::{fmt_bytes, PerfInfo, Snapshot};
@@ -190,6 +186,23 @@ fn clock_ago(secs_ago: u32) -> String {
     format!("{:02}:{:02}:{:02}", t / 3600, (t % 3600) / 60, t % 60)
 }
 
+/// Appends natural-curve (Catmull-Rom → Bézier) segments through `pts`,
+/// assuming the builder's current point is `pts[0]` — same math as
+/// gpui-component's StrokeStyle::Natural, but only the samples are smoothed,
+/// so baseline anchor and close edges stay straight.
+fn smooth_through(b: &mut gpui::PathBuilder, pts: &[(f32, f32)]) {
+    let n = pts.len();
+    for i in 0..n - 1 {
+        let p0 = pts[i.saturating_sub(1)];
+        let p1 = pts[i];
+        let p2 = pts[i + 1];
+        let p3 = pts[(i + 2).min(n - 1)];
+        let c1 = point(px(p1.0 + (p2.0 - p0.0) / 6.0), px(p1.1 + (p2.1 - p0.1) / 6.0));
+        let c2 = point(px(p2.0 - (p3.0 - p1.0) / 6.0), px(p2.1 - (p3.1 - p1.1) / 6.0));
+        b.cubic_bezier_to(point(px(p2.0), px(p2.1)), c1, c2);
+    }
+}
+
 /// History chart. Values normalize against `max`; newest sample hugs the
 /// right edge; `offset` (0..1 of one sample step) slides everything left for
 /// continuous scroll, with the newest value held to the right edge so no gap
@@ -211,14 +224,15 @@ fn chart_with(series: Vec<ChartSeries>, max: f32, height: f32, offset: f32) -> g
                 move |bounds, _, window, _| {
                     let w = f32::from(bounds.size.width);
                     let h = f32::from(bounds.size.height);
+                    let x0 = f32::from(bounds.origin.x);
+                    let y0 = f32::from(bounds.origin.y);
                     for s in &series {
                         if s.values.len() < 2 {
                             continue;
                         }
                         let n = s.values.len();
                         let step = w / (HISTORY.max(2) - 1) as f32;
-                        let start_x = w - step * (n - 1) as f32 - step * offset;
-                        // Local coords; the plot shapes add bounds.origin.
+                        let start_x = x0 + w - step * (n - 1) as f32 - step * offset;
                         let mut pts: Vec<(f32, f32)> = s
                             .values
                             .iter()
@@ -226,53 +240,50 @@ fn chart_with(series: Vec<ChartSeries>, max: f32, height: f32, offset: f32) -> g
                             .map(|(i, v)| {
                                 (
                                     start_x + step * i as f32,
-                                    h * (1.0 - (v / max).clamp(0.0, 1.0)),
+                                    y0 + h * (1.0 - (v / max).clamp(0.0, 1.0)),
                                 )
                             })
                             .collect();
                         // Hold the newest value to the right edge.
-                        let last_y = pts.last().map(|p| p.1).unwrap_or(h);
-                        pts.push((w, last_y));
+                        let last_y = pts.last().map(|p| p.1).unwrap_or(y0 + h);
+                        pts.push((x0 + w, last_y));
                         if s.stroke {
-                            PlotLine::new()
-                                .data(pts)
-                                .x(|p: &(f32, f32)| Some(p.0))
-                                .y(|p: &(f32, f32)| Some(p.1))
-                                .stroke(rgba(s.color))
-                                .stroke_width(px(1.5))
-                                .stroke_style(StrokeStyle::Natural)
-                                .paint(&bounds, window);
+                            let mut b = gpui::PathBuilder::stroke(px(1.5));
+                            b.move_to(point(px(pts[0].0), px(pts[0].1)));
+                            smooth_through(&mut b, &pts);
+                            if let Ok(path) = b.build() {
+                                window.paint_path(path, rgba(s.color));
+                            }
                         } else {
                             // Reference-style fill: fades toward the bottom.
-                            // Anchor the first point at the baseline so the
-                            // area's close edge never cuts across the chart
-                            // while history is still short.
+                            // The baseline anchor and close edges are straight
+                            // lines outside the smoothed samples, so they
+                            // can't bulge the curve.
                             let base = s.color >> 8;
                             let alpha = s.color & 0xff;
-                            let mut fill_pts = pts.clone();
-                            fill_pts.insert(0, (start_x, h));
-                            Area::new()
-                                .data(fill_pts)
-                                .x(|p: &(f32, f32)| Some(p.0))
-                                .y1(|p: &(f32, f32)| Some(p.1))
-                                .y0(h)
-                                .fill(linear_gradient(
-                                    180.,
-                                    linear_color_stop(rgba(base << 8 | alpha), 0.),
-                                    linear_color_stop(rgba(base << 8 | alpha / 5), 1.),
-                                ))
-                                .stroke(rgba(0))
-                                .stroke_style(StrokeStyle::Natural)
-                                .paint(&bounds, window);
+                            let mut b = gpui::PathBuilder::fill();
+                            b.move_to(point(px(pts[0].0), px(y0 + h)));
+                            b.line_to(point(px(pts[0].0), px(pts[0].1)));
+                            smooth_through(&mut b, &pts);
+                            b.line_to(point(px(x0 + w), px(y0 + h)));
+                            b.close();
+                            if let Ok(path) = b.build() {
+                                window.paint_path(
+                                    path,
+                                    linear_gradient(
+                                        180.,
+                                        linear_color_stop(rgba(base << 8 | alpha), 0.),
+                                        linear_color_stop(rgba(base << 8 | alpha / 5), 1.),
+                                    ),
+                                );
+                            }
                             if let Some(outline) = s.outline {
-                                PlotLine::new()
-                                    .data(pts)
-                                    .x(|p: &(f32, f32)| Some(p.0))
-                                    .y(|p: &(f32, f32)| Some(p.1))
-                                    .stroke(rgba(outline))
-                                    .stroke_width(px(1.5))
-                                    .stroke_style(StrokeStyle::Natural)
-                                    .paint(&bounds, window);
+                                let mut ob = gpui::PathBuilder::stroke(px(1.5));
+                                ob.move_to(point(px(pts[0].0), px(pts[0].1)));
+                                smooth_through(&mut ob, &pts);
+                                if let Ok(path) = ob.build() {
+                                    window.paint_path(path, rgba(outline));
+                                }
                             }
                         }
                     }
