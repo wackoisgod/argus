@@ -1454,10 +1454,29 @@ impl Render for TaskManagerApp {
     }
 }
 
+/// gpui-component's icons resolve through the app's AssetSource; the
+/// published crate doesn't bundle them, so serve the few we use ourselves.
+struct ArgusAssets;
+
+impl gpui::AssetSource for ArgusAssets {
+    fn load(&self, path: &str) -> gpui::Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        // Lucide "check", matching the icon set gpui-component targets.
+        const CHECK_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>"##;
+        Ok(match path {
+            "icons/check.svg" => Some(std::borrow::Cow::Borrowed(CHECK_SVG)),
+            _ => None,
+        })
+    }
+
+    fn list(&self, _path: &str) -> gpui::Result<Vec<SharedString>> {
+        Ok(Vec::new())
+    }
+}
+
 fn main() {
     tlog("main entry");
     let rx = spawn_sampler();
-    Application::new().run(move |cx: &mut App| {
+    Application::new().with_assets(ArgusAssets).run(move |cx: &mut App| {
         tlog("gpui run callback");
         gpui_component::init(cx);
         Theme::change(ThemeMode::Dark, None, cx);
