@@ -181,7 +181,11 @@ impl DirectWriteTextSystem {
 
             let system_font_collection = {
                 let mut result = std::mem::zeroed();
-                factory.GetSystemFontCollection(false, &mut result, true)?;
+                // TaskManager patch: checkForUpdates=FALSE serves the cached
+                // collection (~1ms) instead of revalidating the font set
+                // (~30ms). Fonts installed mid-session just won't appear
+                // until next launch — irrelevant here.
+                factory.GetSystemFontCollection(false, &mut result, false)?;
                 result.unwrap()
             };
             let custom_font_set = builder.CreateFontSet()?;
