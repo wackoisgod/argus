@@ -21,8 +21,25 @@ jobs:
           New-Item -ItemType Directory dist | Out-Null
           Copy-Item target/release/argus.exe dist/
           Compress-Archive -Path dist/argus.exe -DestinationPath "argus-${{ github.ref_name }}-windows-x64.zip"
+      - name: Extract changelog section
+        id: notes
+        run: |
+          $version = "${{ github.ref_name }}".TrimStart("v")
+          $content = Get-Content CHANGELOG.md -Raw
+          $pattern = "(?ms)^## \[$([regex]::Escape($version))\][^\n]*\n(.*?)(?=^## \[|^\[|\Z)"
+          $m = [regex]::Match($content, $pattern)
+          if ($m.Success) {
+            $m.Groups[1].Value.Trim() | Set-Content release-notes.md
+            "found=true" >> $env:GITHUB_OUTPUT
+          } else {
+            Set-Content release-notes.md ""
+            "found=false" >> $env:GITHUB_OUTPUT
+          }
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
           files: argus-*-windows-x64.zip
-          generate_release_notes: true
+          body_path: release-notes.md
+          # Fall back to auto-generated notes when the tag has no
+          # changelog section.
+          generate_release_notes: ${{ steps.notes.outputs.found != 'true' }}
