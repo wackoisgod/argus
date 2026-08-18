@@ -56,6 +56,10 @@ pub struct Enricher {
     /// `None` marks an in-flight resolution so it is scheduled exactly once.
     cache: Arc<Mutex<FxHashMap<Key, Option<Arc<Enriched>>>>>,
     wts: Arc<Mutex<WtsUsers>>,
+    /// PNG icon per exe path, so the 40 processes of one app share a single
+    /// allocation (and downstream, a single decoded GPU image). Bounded by
+    /// the number of unique executables seen.
+    icons: Arc<Mutex<FxHashMap<String, Option<Arc<Vec<u8>>>>>>,
     pool: rayon::ThreadPool,
 }
 
@@ -73,6 +77,7 @@ impl Enricher {
         Enricher {
             cache: Arc::new(Mutex::new(FxHashMap::default())),
             wts: Arc::new(Mutex::new(WtsUsers::default())),
+            icons: Arc::new(Mutex::new(FxHashMap::default())),
             pool,
         }
     }
@@ -88,8 +93,9 @@ impl Enricher {
                 drop(cache);
                 let cache = Arc::clone(&self.cache);
                 let wts = Arc::clone(&self.wts);
+                let icons = Arc::clone(&self.icons);
                 self.pool.spawn(move || {
-                    let info = Arc::new(resolve(key.0, &wts));
+                    let info = Arc::new(resolve(key.0, &wts, &icons));
                     cache.lock().unwrap().insert(key, Some(info));
                 });
                 None
@@ -109,7 +115,11 @@ impl Default for Enricher {
     }
 }
 
-fn resolve(pid: u32, wts: &Mutex<WtsUsers>) -> Enriched {
+fn resolve(
+    pid: u32,
+    wts: &Mutex<WtsUsers>,
+    icons: &Mutex<FxHashMap<String, Option<Arc<Vec<u8>>>>>,
+) -> Enriched {
     let mut user: Arc<str> = Arc::from("");
     let mut description: Arc<str> = Arc::from("");
     let mut company: Arc<str> = Arc::from("");
@@ -152,9 +162,19 @@ fn resolve(pid: u32, wts: &Mutex<WtsUsers>) -> Enriched {
         if let Some(c) = c {
             company = c;
         }
-        let mut pathz = path.clone();
-        pathz.push(0);
-        icon_png = crate::icon::icon_png_for_path(&pathz).map(Arc::new);
+        // One extraction (and one PNG allocation) per unique exe path.
+        let path_key = String::from_utf16_lossy(path);
+        let cached = icons.lock().unwrap().get(&path_key).cloned();
+        icon_png = match cached {
+            Some(icon) => icon,
+            None => {
+                let mut pathz = path.clone();
+                pathz.push(0);
+                let icon = crate::icon::icon_png_for_path(&pathz).map(Arc::new);
+                icons.lock().unwrap().insert(path_key, icon.clone());
+                icon
+            }
+        };
     }
     // Service/system processes refuse token access unelevated; the WTS
     // enumeration still knows their user (SYSTEM, LOCAL SERVICE, ...).

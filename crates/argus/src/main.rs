@@ -287,9 +287,10 @@ struct HeaderTotals {
 struct ProcessTableDelegate {
     columns: Vec<Column>,
     totals: HeaderTotals,
-    /// pid → (source-bytes identity, decoded image), so gpui sees a stable
-    /// image id per icon instead of re-decoding every refresh.
-    icon_cache: rustc_hash::FxHashMap<u32, (usize, std::sync::Arc<gpui::Image>)>,
+    /// PNG-bytes identity → decoded image. Keyed by the shared PNG Arc's
+    /// address (icons are deduped per exe in the collector), so gpui sees
+    /// one stable image per unique icon no matter how many processes use it.
+    icon_cache: rustc_hash::FxHashMap<usize, std::sync::Arc<gpui::Image>>,
     /// Every process from the latest snapshot, unfiltered and unsorted.
     all_rows: Vec<ProcRow>,
     /// The visible view: sections + filtered, sorted processes.
@@ -539,8 +540,12 @@ impl ProcessTableDelegate {
                 iowrite_s: s(w_iowrite, &|| fmt_mibs(p.write_bytes_per_sec)),
             });
         }
-        let live: rustc_hash::FxHashSet<u32> = self.all_rows.iter().map(|r| r.pid).collect();
-        self.icon_cache.retain(|pid, _| live.contains(pid));
+        let live: rustc_hash::FxHashSet<usize> = self
+            .all_rows
+            .iter()
+            .filter_map(|r| r.icon.as_ref().map(|b| std::sync::Arc::as_ptr(b) as usize))
+            .collect();
+        self.icon_cache.retain(|identity, _| live.contains(identity));
         self.rebuild_view();
     }
 
@@ -578,18 +583,16 @@ impl ProcessTableDelegate {
 
     /// Decode-once icon lookup: gpui identifies images by id, so handing it
     /// a fresh Image every refresh would re-decode and re-upload each tick.
-    fn icon_image(&mut self, pid: u32, bytes: &std::sync::Arc<Vec<u8>>) -> std::sync::Arc<gpui::Image> {
+    fn icon_image(&mut self, bytes: &std::sync::Arc<Vec<u8>>) -> std::sync::Arc<gpui::Image> {
         let identity = std::sync::Arc::as_ptr(bytes) as usize;
-        if let Some((cached_id, image)) = self.icon_cache.get(&pid) {
-            if *cached_id == identity {
-                return image.clone();
-            }
+        if let Some(image) = self.icon_cache.get(&identity) {
+            return image.clone();
         }
         let image = std::sync::Arc::new(gpui::Image::from_bytes(
             gpui::ImageFormat::Png,
             (**bytes).clone(),
         ));
-        self.icon_cache.insert(pid, (identity, image.clone()));
+        self.icon_cache.insert(identity, image.clone());
         image
     }
 
@@ -972,7 +975,7 @@ impl TableDelegate for ProcessTableDelegate {
                         let icon = row
                             .icon
                             .as_ref()
-                            .map(|bytes| self.icon_image(row.pid, bytes));
+                            .map(|bytes| self.icon_image(bytes));
                         let content = div()
                             .flex()
                             .items_center()
@@ -1245,6 +1248,7 @@ fn spawn_sampler() -> futures::channel::mpsc::Receiver<Snapshot> {
             std::thread::sleep(Duration::from_millis(150));
             let _ = tx.try_send(sampler.sample());
             let mut hwnd: isize = 0;
+            let mut was_minimized = false;
             loop {
                 let minimized = window_minimized(&mut hwnd);
                 let interval = if minimized { 2500 } else { 1000 };
@@ -1262,6 +1266,15 @@ fn spawn_sampler() -> futures::channel::mpsc::Receiver<Snapshot> {
                 // block the sampler. Minimized ticks skip the GPU probe and
                 // connection walk nobody can see.
                 let still_minimized = minimized && window_minimized(&mut hwnd);
+                // On the transition into the tray, hand the working set back
+                // to the OS — Task Manager does the same. Pages fault back
+                // in lazily on restore.
+                if still_minimized && !was_minimized {
+                    use windows_sys::Win32::System::ProcessStatus::K32EmptyWorkingSet;
+                    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+                    unsafe { K32EmptyWorkingSet(GetCurrentProcess()) };
+                }
+                was_minimized = still_minimized;
                 match tx.try_send(sampler.sample_with(still_minimized)) {
                     Err(e) if e.is_disconnected() => break,
                     _ => {}
