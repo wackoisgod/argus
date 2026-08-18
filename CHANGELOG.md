@@ -6,6 +6,8 @@ All notable changes to Argus are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-18
+
 ### Added
 - Column picker: right-click any header for a categorized, checkable menu
   (Process / Image / CPU / Memory / I/O / Network / GPU / Objects) with
@@ -79,5 +81,6 @@ Initial release.
 - Windows GUI binary with embedded Argus icon, GitHub Actions CI, and
   tag-driven releases.
 
-[Unreleased]: https://github.com/wackoisgod/argus/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/wackoisgod/argus/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/wackoisgod/argus/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/wackoisgod/argus/releases/tag/v0.1.0
