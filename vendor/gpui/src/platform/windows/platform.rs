@@ -92,7 +92,13 @@ impl WindowsPlatform {
         unsafe {
             OleInitialize(None).context("unable to initialize Windows OLE")?;
         }
-        let directx_devices = DirectXDevices::new().context("Creating DirectX devices")?;
+        // TaskManager patch: D3D11 device creation can block ~100ms inside
+        // the display driver; run it concurrently with DirectWrite setup
+        // (system font collection etc.) and join at the last moment.
+        let directx_thread = std::thread::Builder::new()
+            .name("directx-init".into())
+            .spawn(DirectXDevices::new)
+            .context("Spawning DirectX init thread")?;
         let (main_sender, main_receiver) = flume::unbounded::<Runnable>();
         let validation_number = if usize::BITS == 64 {
             rand::random::<u64>() as usize
@@ -100,10 +106,14 @@ impl WindowsPlatform {
             rand::random::<u32>() as usize
         };
         let raw_window_handles = Arc::new(RwLock::new(SmallVec::new()));
-        let text_system = Arc::new(
-            DirectWriteTextSystem::new(&directx_devices)
-                .context("Error creating DirectWriteTextSystem")?,
-        );
+        let (text_system, directx_devices) = DirectWriteTextSystem::new_with(move || {
+            directx_thread
+                .join()
+                .map_err(|_| anyhow::anyhow!("DirectX init thread panicked"))?
+                .context("Creating DirectX devices")
+        })
+        .context("Error creating DirectWriteTextSystem")?;
+        let text_system = Arc::new(text_system);
         register_platform_window_class();
         let mut context = PlatformWindowCreateContext {
             inner: None,

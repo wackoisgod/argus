@@ -69,35 +69,9 @@ struct FontIdentifier {
     style: i32,
 }
 
-impl DirectWriteComponent {
-    pub fn new(directx_devices: &DirectXDevices) -> Result<Self> {
-        // todo: ideally this would not be a large unsafe block but smaller isolated ones for easier auditing
-        unsafe {
-            let factory: IDWriteFactory5 = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
-            // The `IDWriteInMemoryFontFileLoader` here is supported starting from
-            // Windows 10 Creators Update, which consequently requires the entire
-            // `DirectWriteTextSystem` to run on `win10 1703`+.
-            let in_memory_loader = factory.CreateInMemoryFontFileLoader()?;
-            factory.RegisterFontFileLoader(&in_memory_loader)?;
-            let builder = factory.CreateFontSetBuilder()?;
-            let mut locale_vec = vec![0u16; LOCALE_NAME_MAX_LENGTH as usize];
-            GetUserDefaultLocaleName(&mut locale_vec);
-            let locale = String::from_utf16_lossy(&locale_vec);
-            let text_renderer = Arc::new(TextRendererWrapper::new(&locale));
-
-            let gpu_state = GPUState::new(directx_devices)?;
-
-            Ok(DirectWriteComponent {
-                locale,
-                factory,
-                in_memory_loader,
-                builder,
-                text_renderer,
-                gpu_state,
-            })
-        }
-    }
-}
+// TaskManager patch: DirectWriteComponent construction lives inline in
+// DirectWriteTextSystem::new_with so the GPU-dependent GPUState attaches
+// after all DirectWrite-only setup.
 
 impl GPUState {
     fn new(directx_devices: &DirectXDevices) -> Result<Self> {
@@ -183,32 +157,63 @@ impl GPUState {
 }
 
 impl DirectWriteTextSystem {
-    pub(crate) fn new(directx_devices: &DirectXDevices) -> Result<Self> {
-        let components = DirectWriteComponent::new(directx_devices)?;
-        let system_font_collection = unsafe {
-            let mut result = std::mem::zeroed();
-            components
-                .factory
-                .GetSystemFontCollection(false, &mut result, true)?;
-            result.unwrap()
-        };
-        let custom_font_set = unsafe { components.builder.CreateFontSet()? };
-        let custom_font_collection = unsafe {
-            components
-                .factory
-                .CreateFontCollectionFromFontSet(&custom_font_set)?
-        };
-        let system_ui_font_name = get_system_ui_font_name();
+    /// TaskManager patch: all DirectWrite setup (including the expensive
+    /// system-font-collection build) runs before `directx_devices` is
+    /// resolved, so a caller can create the D3D device on another thread
+    /// concurrently and join it at the last moment — GPUState is the only
+    /// part that needs it.
+    pub(crate) fn new_with(
+        directx_devices: impl FnOnce() -> Result<DirectXDevices>,
+    ) -> Result<(Self, DirectXDevices)> {
+        // todo: ideally this would not be a large unsafe block but smaller isolated ones for easier auditing
+        unsafe {
+            let factory: IDWriteFactory5 = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
+            // The `IDWriteInMemoryFontFileLoader` here is supported starting from
+            // Windows 10 Creators Update, which consequently requires the entire
+            // `DirectWriteTextSystem` to run on `win10 1703`+.
+            let in_memory_loader = factory.CreateInMemoryFontFileLoader()?;
+            factory.RegisterFontFileLoader(&in_memory_loader)?;
+            let builder = factory.CreateFontSetBuilder()?;
+            let mut locale_vec = vec![0u16; LOCALE_NAME_MAX_LENGTH as usize];
+            GetUserDefaultLocaleName(&mut locale_vec);
+            let locale = String::from_utf16_lossy(&locale_vec);
+            let text_renderer = Arc::new(TextRendererWrapper::new(&locale));
 
-        Ok(Self(RwLock::new(DirectWriteState {
-            components,
-            system_ui_font_name,
-            system_font_collection,
-            custom_font_collection,
-            fonts: Vec::new(),
-            font_selections: HashMap::default(),
-            font_id_by_identifier: HashMap::default(),
-        })))
+            let system_font_collection = {
+                let mut result = std::mem::zeroed();
+                factory.GetSystemFontCollection(false, &mut result, true)?;
+                result.unwrap()
+            };
+            let custom_font_set = builder.CreateFontSet()?;
+            let custom_font_collection =
+                factory.CreateFontCollectionFromFontSet(&custom_font_set)?;
+            let system_ui_font_name = get_system_ui_font_name();
+
+            // Join the (possibly concurrent) device creation only now.
+            let directx_devices = directx_devices()?;
+            let gpu_state = GPUState::new(&directx_devices)?;
+            let components = DirectWriteComponent {
+                locale,
+                factory,
+                in_memory_loader,
+                builder,
+                text_renderer,
+                gpu_state,
+            };
+
+            Ok((
+                Self(RwLock::new(DirectWriteState {
+                    components,
+                    system_ui_font_name,
+                    system_font_collection,
+                    custom_font_collection,
+                    fonts: Vec::new(),
+                    font_selections: HashMap::default(),
+                    font_id_by_identifier: HashMap::default(),
+                })),
+                directx_devices,
+            ))
+        }
     }
 
     pub(crate) fn handle_gpu_lost(&self, directx_devices: &DirectXDevices) {
