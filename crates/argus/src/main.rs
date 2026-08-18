@@ -416,6 +416,25 @@ impl ProcessTableDelegate {
         };
         self.all_rows.clear();
         self.all_rows.reserve(snap.processes.len());
+        // Optional-column strings are only worth formatting when the column
+        // is visible — this loop runs every second for every process.
+        let want = |k: &str| self.columns.iter().any(|c| c.key.as_ref() == k);
+        let (w_parent, w_session, w_start) = (want("parent"), want("session"), want("start"));
+        let (w_cmdline, w_company, w_path) = (want("cmdline"), want("company"), want("path"));
+        let (w_cpuk, w_cpuu, w_cputime, w_priority) =
+            (want("cpuk"), want("cpuu"), want("cputime"), want("priority"));
+        let (w_commit, w_ws, w_wspeak, w_virt) =
+            (want("commit"), want("ws"), want("wspeak"), want("virt"));
+        let (w_faults, w_pagedpool, w_npool) =
+            (want("faults"), want("pagedpool"), want("npool"));
+        let (w_ioread, w_iowrite) = (want("ioread"), want("iowrite"));
+        let s = |on: bool, f: &dyn Fn() -> String| -> SharedString {
+            if on {
+                f().into()
+            } else {
+                SharedString::default()
+            }
+        };
         for p in snap.processes.iter().filter(|p| p.raw.pid != 0) {
             let (user, desc, icon, is_windows) = p
                 .enriched
@@ -432,6 +451,7 @@ impl ProcessTableDelegate {
             let (company, path, cmdline) = p
                 .enriched
                 .as_ref()
+                .filter(|_| w_company || w_path || w_cmdline)
                 .map(|e| {
                     (
                         e.company.to_string(),
@@ -473,38 +493,50 @@ impl ProcessTableDelegate {
                 threads_s: p.raw.threads.to_string().into(),
                 handles: p.raw.handles,
                 handles_s: p.raw.handles.to_string().into(),
-                parent_s: p.raw.parent_pid.to_string().into(),
-                session_s: p.raw.session_id.to_string().into(),
-                start_s: fmt_start_time(p.raw.create_time).into(),
-                cmdline_s: cmdline.into(),
-                company_s: company.into(),
-                path_s: path.into(),
+                parent_s: s(w_parent, &|| p.raw.parent_pid.to_string()),
+                session_s: s(w_session, &|| p.raw.session_id.to_string()),
+                start_s: s(w_start, &|| fmt_start_time(p.raw.create_time)),
+                cmdline_s: if w_cmdline {
+                    cmdline.into()
+                } else {
+                    SharedString::default()
+                },
+                company_s: if w_company {
+                    company.into()
+                } else {
+                    SharedString::default()
+                },
+                path_s: if w_path {
+                    path.into()
+                } else {
+                    SharedString::default()
+                },
                 cpuk: p.kernel_percent,
-                cpuk_s: format!("{:.1}%", p.kernel_percent).into(),
+                cpuk_s: s(w_cpuk, &|| format!("{:.1}%", p.kernel_percent)),
                 cpuu: user_pct,
-                cpuu_s: format!("{user_pct:.1}%").into(),
+                cpuu_s: s(w_cpuu, &|| format!("{user_pct:.1}%")),
                 cputime,
-                cputime_s: fmt_cpu_time(cputime).into(),
+                cputime_s: s(w_cputime, &|| fmt_cpu_time(cputime)),
                 priority: p.raw.base_priority,
-                priority_s: p.raw.base_priority.to_string().into(),
+                priority_s: s(w_priority, &|| p.raw.base_priority.to_string()),
                 commit: p.raw.private_bytes,
-                commit_s: fmt_bytes(p.raw.private_bytes).into(),
+                commit_s: s(w_commit, &|| fmt_bytes(p.raw.private_bytes)),
                 ws: p.raw.working_set,
-                ws_s: fmt_bytes(p.raw.working_set).into(),
+                ws_s: s(w_ws, &|| fmt_bytes(p.raw.working_set)),
                 wspeak: p.raw.peak_working_set,
-                wspeak_s: fmt_bytes(p.raw.peak_working_set).into(),
+                wspeak_s: s(w_wspeak, &|| fmt_bytes(p.raw.peak_working_set)),
                 virt: p.raw.virtual_size,
-                virt_s: fmt_bytes(p.raw.virtual_size).into(),
+                virt_s: s(w_virt, &|| fmt_bytes(p.raw.virtual_size)),
                 faults: p.raw.page_faults as u64,
-                faults_s: p.raw.page_faults.to_string().into(),
+                faults_s: s(w_faults, &|| p.raw.page_faults.to_string()),
                 pagedpool: p.raw.paged_pool,
-                pagedpool_s: fmt_bytes(p.raw.paged_pool).into(),
+                pagedpool_s: s(w_pagedpool, &|| fmt_bytes(p.raw.paged_pool)),
                 npool: p.raw.nonpaged_pool,
-                npool_s: fmt_bytes(p.raw.nonpaged_pool).into(),
+                npool_s: s(w_npool, &|| fmt_bytes(p.raw.nonpaged_pool)),
                 ioread: p.read_bytes_per_sec,
-                ioread_s: fmt_mibs(p.read_bytes_per_sec).into(),
+                ioread_s: s(w_ioread, &|| fmt_mibs(p.read_bytes_per_sec)),
                 iowrite: p.write_bytes_per_sec,
-                iowrite_s: fmt_mibs(p.write_bytes_per_sec).into(),
+                iowrite_s: s(w_iowrite, &|| fmt_mibs(p.write_bytes_per_sec)),
             });
         }
         let live: rustc_hash::FxHashSet<u32> = self.all_rows.iter().map(|r| r.pid).collect();
@@ -1266,14 +1298,16 @@ impl TaskManagerApp {
 
         // Chart scroll animation: ~30fps notifications while the Performance
         // tab is visible (actual paint rate is governed by the adaptive
-        // vsync layer); near-dormant on the Processes tab.
+        // vsync layer); near-dormant on the Processes tab or while the
+        // window is minimized — nobody sees those frames.
         cx.spawn(async move |this, cx| {
+            let mut hwnd: isize = 0;
             loop {
-                let mut on_perf_tab = false;
+                let mut animate = false;
                 if this
                     .update(cx, |this, cx| {
-                        on_perf_tab = this.tab == 1;
-                        if on_perf_tab {
+                        animate = this.tab == 1 && !window_minimized(&mut hwnd);
+                        if animate {
                             cx.notify();
                         }
                     })
@@ -1281,8 +1315,7 @@ impl TaskManagerApp {
                 {
                     break;
                 }
-                Timer::after(Duration::from_millis(if on_perf_tab { 33 } else { 250 }))
-                    .await;
+                Timer::after(Duration::from_millis(if animate { 33 } else { 250 })).await;
             }
         })
         .detach();

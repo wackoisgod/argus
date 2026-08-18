@@ -114,6 +114,14 @@ pub struct GpuMonitor {
     /// flag, for adapter utilization (busiest engine). Every QueryStatistics
     /// call can stall in the driver, so idle engines poll at reduced rate.
     node_prev: Vec<Vec<(u64, std::time::Instant, bool)>>,
+    /// Nodes that have ever shown global running-time activity. Per-process
+    /// probes only query these: a node whose global delta is zero cannot have
+    /// accumulated time for any process, and every skipped node is one fewer
+    /// driver call that can stall the CPU. Grows monotonically.
+    ever_active: Vec<Vec<bool>>,
+    /// Set when `ever_active` gained a node last perf tick; per-process
+    /// baselines are then rebuilt so cumulative totals stay consistent.
+    nodes_changed: bool,
     /// Cached (vram_used, vram_total, shared_used, shared_total, temp) per
     /// adapter. The segment and physical-adapter queries make the AMD
     /// driver stall the CPU polling hardware (~9ms), so they refresh every
@@ -135,12 +143,24 @@ impl GpuMonitor {
             .iter()
             .map(|a| vec![(0u64, std::time::Instant::now(), true); a.node_count as usize])
             .collect();
+        // Seed node 0 (the 3D engine) on hardware adapters so the first
+        // ticks have a probe set before global activity is known; software
+        // adapters start fully skipped.
+        let ever_active = adapters
+            .iter()
+            .map(|a| {
+                let hw = !a.name.contains("Basic Render");
+                (0..a.node_count).map(|n| hw && n == 0).collect()
+            })
+            .collect();
         let adapter_count = adapters.len();
         GpuMonitor {
             adapters,
             prev: FxHashMap::default(),
             active: FxHashSet::default(),
             node_prev,
+            ever_active,
+            nodes_changed: false,
             mem_temp_cache: vec![(0, 0, 0, 0, None); adapter_count],
             perf_tick: 0,
             tick: 0,
@@ -192,6 +212,10 @@ impl GpuMonitor {
                     perf.engine_pcts[node as usize] = pct;
                     perf.utilization = perf.utilization.max(pct);
                     active = pct > 0.1;
+                }
+                if active && !self.ever_active[ai][node as usize] {
+                    self.ever_active[ai][node as usize] = true;
+                    self.nodes_changed = true;
                 }
                 self.node_prev[ai][node as usize] = (total, now, active);
             }
@@ -254,8 +278,17 @@ impl GpuMonitor {
     }
 
     /// Total cumulative GPU running time for one process, summed across all
-    /// adapters and engine nodes. `None` if the process can't be opened.
+    /// adapters' *ever-active* engine nodes (see `ever_active` — skipped
+    /// nodes provably contribute zero). `None` if the process can't be
+    /// opened.
     fn process_running_time(&self, pid: u32) -> Option<u64> {
+        if !self
+            .ever_active
+            .iter()
+            .any(|nodes| nodes.iter().any(|&a| a))
+        {
+            return None;
+        }
         // NB: dxgkrnl rejects PROCESS_QUERY_LIMITED_INFORMATION handles with
         // STATUS_INVALID_PARAMETER; full QUERY_INFORMATION is required.
         let handle = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION, 0, pid) };
@@ -263,8 +296,11 @@ impl GpuMonitor {
             return None;
         }
         let mut total = 0u64;
-        for adapter in &self.adapters {
+        for (ai, adapter) in self.adapters.iter().enumerate() {
             for node in 0..adapter.node_count {
+                if !self.ever_active[ai][node as usize] {
+                    continue;
+                }
                 let mut q = zeroed_stats();
                 q.ty = TYPE_PROCESS_NODE;
                 q.luid_low = adapter.luid_low;
@@ -288,6 +324,13 @@ impl GpuMonitor {
         let mut out = FxHashMap::default();
         if self.adapters.is_empty() {
             return out;
+        }
+        // The probe set grew: cached totals cover a smaller node set than the
+        // next probe will, which would read as a burst of activity. Rebuild
+        // baselines instead (one tick of missing per-process GPU data).
+        if self.nodes_changed {
+            self.nodes_changed = false;
+            self.prev.clear();
         }
         let mut next_prev = FxHashMap::default();
         for raw in procs {
@@ -316,7 +359,7 @@ impl GpuMonitor {
                     let delta = total.saturating_sub(*prev_total);
                     // RunningTime is in 100ns units (per System Informer,
                     // despite the header comment claiming microseconds).
-                    let pct = (delta as f64 / (span * 10_000_000.0) * 100.0) as f32;
+                    let pct = (delta as f64 / (span * 10_000_000.0) * 100.0).min(100.0) as f32;
                     if pct > 0.05 {
                         out.insert(raw.pid, pct);
                     }
