@@ -36,6 +36,11 @@ const TEXT_DIM: u32 = 0x7f849c;
 const ACCENT: u32 = 0x89b4fa;
 
 /// Disk rates in fixed MiB/s, Task Manager style.
+/// Right-aligned numeric table cell, matching the right-aligned headers.
+fn num_td(value: gpui::SharedString) -> gpui::AnyElement {
+    div().w_full().text_right().child(value).into_any_element()
+}
+
 fn fmt_mibs(bytes_per_sec: u64) -> String {
     format!("{:.2} MiB/s", bytes_per_sec as f64 / (1024.0 * 1024.0))
 }
@@ -634,15 +639,16 @@ impl TableDelegate for ProcessTableDelegate {
                             .child(row.name.clone())
                             .into_any_element()
                     }
-                    "pid" => row.pid_s.clone().into_any_element(),
+                    // Numeric cells right-align to match their headers.
+                    "pid" => num_td(row.pid_s.clone()),
                     "user" => row.user_s.clone().into_any_element(),
-                    "cpu" => row.cpu_s.clone().into_any_element(),
-                    "gpu" => row.gpu_s.clone().into_any_element(),
-                    "mem" => row.mem_s.clone().into_any_element(),
-                    "disk" => row.disk_s.clone().into_any_element(),
-                    "net" => row.net_s.clone().into_any_element(),
-                    "threads" => row.threads_s.clone().into_any_element(),
-                    "handles" => row.handles_s.clone().into_any_element(),
+                    "cpu" => num_td(row.cpu_s.clone()),
+                    "gpu" => num_td(row.gpu_s.clone()),
+                    "mem" => num_td(row.mem_s.clone()),
+                    "disk" => num_td(row.disk_s.clone()),
+                    "net" => num_td(row.net_s.clone()),
+                    "threads" => num_td(row.threads_s.clone()),
+                    "handles" => num_td(row.handles_s.clone()),
                     _ => row.exe_s.clone().into_any_element(),
                 }
             }
