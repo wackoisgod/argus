@@ -38,6 +38,8 @@ pub struct ProcessStats {
     pub raw: RawProcess,
     /// Percent of total system CPU (all cores = 100).
     pub cpu_percent: f32,
+    /// Kernel-mode share of `cpu_percent`.
+    pub kernel_percent: f32,
     /// GPU engine utilization percent across all adapters/nodes.
     pub gpu_percent: f32,
     pub read_bytes_per_sec: u64,
@@ -95,6 +97,7 @@ pub struct Snapshot {
 /// Per-process counters remembered from the previous tick.
 struct PrevProc {
     cpu_100ns: i64,
+    kernel_100ns: i64,
     read_bytes: u64,
     write_bytes: u64,
     other_bytes: u64,
@@ -218,10 +221,13 @@ impl Sampler {
             let etw = etw_totals.get(&raw.pid).copied().unwrap_or_default();
             let (mut cpu_pct, mut read_bps, mut write_bps) = (0.0f32, 0u64, 0u64);
             let (mut disk_bps, mut net_bps) = (0u64, 0u64);
+            let mut kernel_pct = 0.0f32;
             if let Some(prev) = self.prev.get(&key) {
                 if d_total > 0 {
                     let d = (cpu_100ns - prev.cpu_100ns).max(0) as u64;
                     cpu_pct = d as f32 / d_total as f32 * 100.0;
+                    let dk = (raw.kernel_time_100ns - prev.kernel_100ns).max(0) as u64;
+                    kernel_pct = dk as f32 / d_total as f32 * 100.0;
                 }
                 if elapsed > 0.05 {
                     read_bps = ((raw.read_bytes.saturating_sub(prev.read_bytes)) as f64
@@ -249,6 +255,7 @@ impl Sampler {
                 key,
                 PrevProc {
                     cpu_100ns,
+                    kernel_100ns: raw.kernel_time_100ns,
                     read_bytes: raw.read_bytes,
                     write_bytes: raw.write_bytes,
                     other_bytes: raw.other_bytes,
@@ -258,6 +265,7 @@ impl Sampler {
             processes.push(ProcessStats {
                 raw: raw.clone(),
                 cpu_percent: cpu_pct,
+                kernel_percent: kernel_pct,
                 gpu_percent: gpu_pcts.get(&raw.pid).copied().unwrap_or(0.0),
                 read_bytes_per_sec: read_bps,
                 write_bytes_per_sec: write_bps,

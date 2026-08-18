@@ -12,7 +12,7 @@ use gpui::{
 };
 use gpui::prelude::*;
 use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::menu::PopupMenu;
+use gpui_component::menu::{ContextMenuExt, PopupMenu, PopupMenuItem};
 use gpui_component::table::{Column, Table, TableDelegate, TableState};
 use gpui_component::theme::{Theme, ThemeMode};
 use gpui_component::Root;
@@ -36,9 +36,24 @@ const TEXT_DIM: u32 = 0x7f849c;
 const ACCENT: u32 = 0x89b4fa;
 
 /// Disk rates in fixed MiB/s, Task Manager style.
-/// Right-aligned numeric table cell, matching the right-aligned headers.
-fn num_td(value: gpui::SharedString) -> gpui::AnyElement {
-    div().w_full().text_right().child(value).into_any_element()
+/// Color of the vertical line between columns (body and header).
+const COL_SEPARATOR: u32 = 0x252539;
+
+/// Full-height cell wrapper: owns the padding (columns are declared p_0) and
+/// draws the column separator on its right edge.
+fn td_cell(content: impl gpui::IntoElement, right: bool) -> gpui::AnyElement {
+    div()
+        .w_full()
+        .h_full()
+        .px(px(8.))
+        .flex()
+        .items_center()
+        .when(right, |d| d.justify_end())
+        .border_r_1()
+        .border_color(rgb(COL_SEPARATOR))
+        .overflow_hidden()
+        .child(content)
+        .into_any_element()
 }
 
 fn fmt_mibs(bytes_per_sec: u64) -> String {
@@ -48,6 +63,97 @@ fn fmt_mibs(bytes_per_sec: u64) -> String {
 /// Network rates in fixed megabits/sec, Task Manager style.
 fn fmt_mbps(bytes_per_sec: u64) -> String {
     format!("{:.2} Mbps", bytes_per_sec as f64 * 8.0 / 1_000_000.0)
+}
+
+/// Everything a column needs: menu category, identity, layout, and whether
+/// its values are numeric (right-aligned, sorted descending first).
+struct ColSpec {
+    category: &'static str,
+    key: &'static str,
+    name: &'static str,
+    width: f32,
+    right: bool,
+    /// In the default set (see DEFAULT_COLUMNS for default *order*).
+    #[allow(dead_code)]
+    default_on: bool,
+}
+
+const fn col(
+    category: &'static str,
+    key: &'static str,
+    name: &'static str,
+    width: f32,
+    right: bool,
+    default_on: bool,
+) -> ColSpec {
+    ColSpec {
+        category,
+        key,
+        name,
+        width,
+        right,
+        default_on,
+    }
+}
+
+/// Every column the table can show, in canonical order. The header context
+/// menu groups them by category, TaskSlinger style.
+const COLUMN_CATALOG: &[ColSpec] = &[
+    col("Process", "name", "Name", 240., false, true),
+    col("Process", "pid", "PID", 80., true, true),
+    col("Process", "parent", "PID parent", 90., true, false),
+    col("Process", "session", "Session", 80., true, false),
+    col("Process", "start", "Start time", 150., false, false),
+    col("Process", "user", "User", 110., false, true),
+    col("Process", "cmdline", "Command line", 400., false, false),
+    col("Image", "company", "Company", 170., false, false),
+    col("Image", "path", "Image path", 400., false, false),
+    col("Image", "exe", "Process name", 280., false, true),
+    col("CPU", "cpu", "CPU", 80., true, true),
+    col("CPU", "cpuk", "CPU (kernel)", 100., true, false),
+    col("CPU", "cpuu", "CPU (user)", 100., true, false),
+    col("CPU", "cputime", "CPU time", 110., true, false),
+    col("CPU", "priority", "Priority", 80., true, false),
+    col("Memory", "mem", "Memory", 110., true, true),
+    col("Memory", "commit", "Commit size", 110., true, false),
+    col("Memory", "ws", "Working set", 110., true, false),
+    col("Memory", "wspeak", "Working set peak", 130., true, false),
+    col("Memory", "virt", "Virtual size", 110., true, false),
+    col("Memory", "faults", "Page faults", 110., true, false),
+    col("Memory", "pagedpool", "Paged pool", 100., true, false),
+    col("Memory", "npool", "Non-paged pool", 120., true, false),
+    col("I/O", "disk", "Disk", 110., true, true),
+    col("I/O", "ioread", "I/O read rate", 110., true, false),
+    col("I/O", "iowrite", "I/O write rate", 110., true, false),
+    col("Network", "net", "Network", 110., true, true),
+    col("GPU", "gpu", "GPU", 80., true, true),
+    col("Objects", "threads", "Threads", 80., true, true),
+    col("Objects", "handles", "Handles", 80., true, true),
+];
+
+/// Default layout (order matters — this is the classic arrangement, not
+/// catalog order).
+const DEFAULT_COLUMNS: &[&str] = &[
+    "name", "pid", "user", "cpu", "gpu", "mem", "disk", "net", "threads", "handles", "exe",
+];
+
+fn col_spec(key: &str) -> Option<&'static ColSpec> {
+    COLUMN_CATALOG.iter().find(|s| s.key == key)
+}
+
+fn build_column(spec: &ColSpec) -> Column {
+    let c = Column::new(spec.key, spec.name).width(px(spec.width)).p_0();
+    if spec.right {
+        c.text_right()
+    } else {
+        c
+    }
+}
+
+/// Where the chosen column set persists across runs.
+fn columns_config_path() -> Option<std::path::PathBuf> {
+    let appdata = std::env::var_os("APPDATA")?;
+    Some(std::path::PathBuf::from(appdata).join("argus").join("columns.cfg"))
 }
 
 /// One display row. All strings are formatted exactly once, when the snapshot
@@ -82,6 +188,72 @@ struct ProcRow {
     threads_s: SharedString,
     handles: u32,
     handles_s: SharedString,
+    // Optional-column data (hidden by default; toggled via the header menu).
+    parent_s: SharedString,
+    session_s: SharedString,
+    start_s: SharedString,
+    cmdline_s: SharedString,
+    company_s: SharedString,
+    path_s: SharedString,
+    cpuk: f32,
+    cpuk_s: SharedString,
+    cpuu: f32,
+    cpuu_s: SharedString,
+    cputime: i64,
+    cputime_s: SharedString,
+    priority: i32,
+    priority_s: SharedString,
+    commit: u64,
+    commit_s: SharedString,
+    ws: u64,
+    ws_s: SharedString,
+    wspeak: u64,
+    wspeak_s: SharedString,
+    virt: u64,
+    virt_s: SharedString,
+    faults: u64,
+    faults_s: SharedString,
+    pagedpool: u64,
+    pagedpool_s: SharedString,
+    npool: u64,
+    npool_s: SharedString,
+    ioread: u64,
+    ioread_s: SharedString,
+    iowrite: u64,
+    iowrite_s: SharedString,
+}
+
+/// FILETIME (100ns since 1601 UTC) → "HH:MM:SS YYYY-MM-DD" local time.
+fn fmt_start_time(create: i64) -> String {
+    use windows_sys::Win32::Foundation::{FILETIME, SYSTEMTIME};
+    use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
+    if create <= 0 {
+        return String::new();
+    }
+    unsafe {
+        let ft = FILETIME {
+            dwLowDateTime: create as u32,
+            dwHighDateTime: (create >> 32) as u32,
+        };
+        let mut st = std::mem::zeroed::<SYSTEMTIME>();
+        if FileTimeToSystemTime(&ft, &mut st) == 0 {
+            return String::new();
+        }
+        let mut lt = std::mem::zeroed::<SYSTEMTIME>();
+        if SystemTimeToTzSpecificLocalTime(std::ptr::null(), &st, &mut lt) == 0 {
+            return String::new();
+        }
+        format!(
+            "{:02}:{:02}:{:02} {:04}-{:02}-{:02}",
+            lt.wHour, lt.wMinute, lt.wSecond, lt.wYear, lt.wMonth, lt.wDay
+        )
+    }
+}
+
+/// Cumulative CPU time (100ns) → "h:mm:ss".
+fn fmt_cpu_time(total_100ns: i64) -> String {
+    let secs = (total_100ns.max(0) / 10_000_000) as u64;
+    format!("{}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
 }
 
 /// A visible table row: either a collapsible section header or a process.
@@ -142,19 +314,7 @@ impl ProcessTableDelegate {
             // gpui-component's built-in sort only triggers on a small header
             // icon, which is undiscoverable — we make the whole header cell
             // clickable instead.
-            columns: vec![
-                Column::new("name", "Name").width(px(240.)),
-                Column::new("pid", "PID").width(px(80.)).text_right(),
-                Column::new("user", "User").width(px(110.)),
-                Column::new("cpu", "CPU").width(px(80.)).text_right(),
-                Column::new("gpu", "GPU").width(px(80.)).text_right(),
-                Column::new("mem", "Memory").width(px(110.)).text_right(),
-                Column::new("disk", "Disk").width(px(110.)).text_right(),
-                Column::new("net", "Network").width(px(110.)).text_right(),
-                Column::new("threads", "Threads").width(px(80.)).text_right(),
-                Column::new("handles", "Handles").width(px(80.)).text_right(),
-                Column::new("exe", "Process name").width(px(280.)),
-            ],
+            columns: Self::load_columns(),
             all_rows: Vec::new(),
             totals: HeaderTotals::default(),
             icon_cache: rustc_hash::FxHashMap::default(),
@@ -165,6 +325,82 @@ impl ProcessTableDelegate {
             collapsed: [false; 3],
             expanded: rustc_hash::FxHashSet::default(),
         }
+    }
+
+    /// Column set from disk (one key per line, display order) or defaults.
+    fn load_columns() -> Vec<Column> {
+        let saved: Vec<String> = columns_config_path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|s| s.lines().map(|l| l.trim().to_string()).collect())
+            .unwrap_or_default();
+        let keys: Vec<&str> = if saved.is_empty() {
+            DEFAULT_COLUMNS.to_vec()
+        } else {
+            saved
+                .iter()
+                .map(|k| k.as_str())
+                .filter(|k| col_spec(k).is_some())
+                .collect()
+        };
+        let mut columns: Vec<Column> = keys
+            .iter()
+            .filter_map(|k| col_spec(k))
+            .map(build_column)
+            .collect();
+        if columns.is_empty() {
+            columns = DEFAULT_COLUMNS
+                .iter()
+                .filter_map(|k| col_spec(k))
+                .map(build_column)
+                .collect();
+        }
+        columns
+    }
+
+    fn save_columns(&self) {
+        if let Some(path) = columns_config_path() {
+            let _ = std::fs::create_dir_all(path.parent().unwrap());
+            let keys: Vec<&str> = self.columns.iter().map(|c| c.key.as_ref()).collect();
+            let _ = std::fs::write(path, keys.join("\n"));
+        }
+    }
+
+    fn has_column(&self, key: &str) -> bool {
+        self.columns.iter().any(|c| c.key.as_ref() == key)
+    }
+
+    /// Show/hide a column. New columns appear at their catalog position
+    /// relative to the currently visible set.
+    fn toggle_column(&mut self, key: &str) {
+        if let Some(ix) = self.columns.iter().position(|c| c.key.as_ref() == key) {
+            if self.columns.len() > 1 {
+                self.columns.remove(ix);
+            }
+        } else if let Some(spec) = col_spec(key) {
+            let catalog_ix = COLUMN_CATALOG.iter().position(|s| s.key == key).unwrap();
+            let insert_at = self
+                .columns
+                .iter()
+                .take_while(|c| {
+                    COLUMN_CATALOG
+                        .iter()
+                        .position(|s| s.key == c.key.as_ref())
+                        .map(|p| p < catalog_ix)
+                        .unwrap_or(false)
+                })
+                .count();
+            self.columns.insert(insert_at, build_column(spec));
+        }
+        self.save_columns();
+    }
+
+    fn reset_columns(&mut self) {
+        self.columns = DEFAULT_COLUMNS
+            .iter()
+            .filter_map(|k| col_spec(k))
+            .map(build_column)
+            .collect();
+        self.save_columns();
     }
 
     fn set_snapshot(&mut self, snap: &Snapshot) {
@@ -193,6 +429,19 @@ impl ProcessTableDelegate {
                     )
                 })
                 .unwrap_or_default();
+            let (company, path, cmdline) = p
+                .enriched
+                .as_ref()
+                .map(|e| {
+                    (
+                        e.company.to_string(),
+                        e.image_path.to_string(),
+                        e.command_line.to_string(),
+                    )
+                })
+                .unwrap_or_default();
+            let cputime = p.raw.user_time_100ns + p.raw.kernel_time_100ns;
+            let user_pct = (p.cpu_percent - p.kernel_percent).max(0.0);
             let exe = p.raw.name.to_string();
             self.all_rows.push(ProcRow {
                 name: if desc.is_empty() {
@@ -224,6 +473,38 @@ impl ProcessTableDelegate {
                 threads_s: p.raw.threads.to_string().into(),
                 handles: p.raw.handles,
                 handles_s: p.raw.handles.to_string().into(),
+                parent_s: p.raw.parent_pid.to_string().into(),
+                session_s: p.raw.session_id.to_string().into(),
+                start_s: fmt_start_time(p.raw.create_time).into(),
+                cmdline_s: cmdline.into(),
+                company_s: company.into(),
+                path_s: path.into(),
+                cpuk: p.kernel_percent,
+                cpuk_s: format!("{:.1}%", p.kernel_percent).into(),
+                cpuu: user_pct,
+                cpuu_s: format!("{user_pct:.1}%").into(),
+                cputime,
+                cputime_s: fmt_cpu_time(cputime).into(),
+                priority: p.raw.base_priority,
+                priority_s: p.raw.base_priority.to_string().into(),
+                commit: p.raw.private_bytes,
+                commit_s: fmt_bytes(p.raw.private_bytes).into(),
+                ws: p.raw.working_set,
+                ws_s: fmt_bytes(p.raw.working_set).into(),
+                wspeak: p.raw.peak_working_set,
+                wspeak_s: fmt_bytes(p.raw.peak_working_set).into(),
+                virt: p.raw.virtual_size,
+                virt_s: fmt_bytes(p.raw.virtual_size).into(),
+                faults: p.raw.page_faults as u64,
+                faults_s: p.raw.page_faults.to_string().into(),
+                pagedpool: p.raw.paged_pool,
+                pagedpool_s: fmt_bytes(p.raw.paged_pool).into(),
+                npool: p.raw.nonpaged_pool,
+                npool_s: fmt_bytes(p.raw.nonpaged_pool).into(),
+                ioread: p.read_bytes_per_sec,
+                ioread_s: fmt_mibs(p.read_bytes_per_sec).into(),
+                iowrite: p.write_bytes_per_sec,
+                iowrite_s: fmt_mibs(p.write_bytes_per_sec).into(),
             });
         }
         let live: rustc_hash::FxHashSet<u32> = self.all_rows.iter().map(|r| r.pid).collect();
@@ -247,7 +528,7 @@ impl ProcessTableDelegate {
     }
 
     fn is_text_column(key: &str) -> bool {
-        matches!(key, "name" | "user" | "exe")
+        col_spec(key).map(|s| !s.right).unwrap_or(false)
     }
 
     /// Text columns (name/user/description) sort ascending on first click;
@@ -316,6 +597,18 @@ impl ProcessTableDelegate {
             agg.net += c.net;
             agg.threads += c.threads;
             agg.handles += c.handles;
+            agg.cpuk += c.cpuk;
+            agg.cpuu += c.cpuu;
+            agg.cputime += c.cputime;
+            agg.commit += c.commit;
+            agg.ws += c.ws;
+            agg.wspeak = agg.wspeak.max(c.wspeak);
+            agg.virt += c.virt;
+            agg.faults += c.faults;
+            agg.pagedpool += c.pagedpool;
+            agg.npool += c.npool;
+            agg.ioread += c.ioread;
+            agg.iowrite += c.iowrite;
         }
         agg.cpu_s = format!("{:.1}%", agg.cpu).into();
         agg.gpu_s = format!("{:.1}%", agg.gpu).into();
@@ -324,6 +617,18 @@ impl ProcessTableDelegate {
         agg.net_s = fmt_mbps(agg.net).into();
         agg.threads_s = agg.threads.to_string().into();
         agg.handles_s = agg.handles.to_string().into();
+        agg.cpuk_s = format!("{:.1}%", agg.cpuk).into();
+        agg.cpuu_s = format!("{:.1}%", agg.cpuu).into();
+        agg.cputime_s = fmt_cpu_time(agg.cputime).into();
+        agg.commit_s = fmt_bytes(agg.commit).into();
+        agg.ws_s = fmt_bytes(agg.ws).into();
+        agg.wspeak_s = fmt_bytes(agg.wspeak).into();
+        agg.virt_s = fmt_bytes(agg.virt).into();
+        agg.faults_s = agg.faults.to_string().into();
+        agg.pagedpool_s = fmt_bytes(agg.pagedpool).into();
+        agg.npool_s = fmt_bytes(agg.npool).into();
+        agg.ioread_s = fmt_mibs(agg.ioread).into();
+        agg.iowrite_s = fmt_mibs(agg.iowrite).into();
         agg.pid_s = format!("{} +{}", agg.pid, others.len()).into();
         agg.name = format!("{} ({})", agg.name, others.len() + 1).into();
         agg
@@ -536,6 +841,37 @@ impl ProcessTableDelegate {
                 "net" => a.net.cmp(&b.net),
                 "threads" => a.threads.cmp(&b.threads),
                 "handles" => a.handles.cmp(&b.handles),
+                "parent" => a.parent.cmp(&b.parent),
+                "session" => a.session.cmp(&b.session),
+                "start" => a.create.cmp(&b.create),
+                "cpuk" => a.cpuk.total_cmp(&b.cpuk),
+                "cpuu" => a.cpuu.total_cmp(&b.cpuu),
+                "cputime" => a.cputime.cmp(&b.cputime),
+                "priority" => a.priority.cmp(&b.priority),
+                "commit" => a.commit.cmp(&b.commit),
+                "ws" => a.ws.cmp(&b.ws),
+                "wspeak" => a.wspeak.cmp(&b.wspeak),
+                "virt" => a.virt.cmp(&b.virt),
+                "faults" => a.faults.cmp(&b.faults),
+                "pagedpool" => a.pagedpool.cmp(&b.pagedpool),
+                "npool" => a.npool.cmp(&b.npool),
+                "ioread" => a.ioread.cmp(&b.ioread),
+                "iowrite" => a.iowrite.cmp(&b.iowrite),
+                "company" => a
+                    .company_s
+                    .as_ref()
+                    .to_ascii_lowercase()
+                    .cmp(&b.company_s.as_ref().to_ascii_lowercase()),
+                "path" => a
+                    .path_s
+                    .as_ref()
+                    .to_ascii_lowercase()
+                    .cmp(&b.path_s.as_ref().to_ascii_lowercase()),
+                "cmdline" => a
+                    .cmdline_s
+                    .as_ref()
+                    .to_ascii_lowercase()
+                    .cmp(&b.cmdline_s.as_ref().to_ascii_lowercase()),
                 _ => a
                     .exe_s
                     .as_ref()
@@ -586,6 +922,8 @@ impl TableDelegate for ProcessTableDelegate {
                     .id(("section", row_ix))
                     .flex()
                     .items_center()
+                    .h_full()
+                    .pl(px(8.))
                     .text_color(rgb(ACCENT))
                     .cursor_pointer()
                     .on_click(cx.listener(move |state, _, _, cx| {
@@ -603,10 +941,12 @@ impl TableDelegate for ProcessTableDelegate {
                             .icon
                             .as_ref()
                             .map(|bytes| self.icon_image(row.pid, bytes));
-                        div()
+                        let content = div()
                             .flex()
                             .items_center()
                             .gap(px(6.))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
                             .when(is_child, |d| d.pl(px(22.)))
                             .child(match group {
                                 Some((expanded, _, key)) => div()
@@ -636,20 +976,39 @@ impl TableDelegate for ProcessTableDelegate {
                                     .into_any_element(),
                                 None => div().w(px(16.)).flex_none().into_any_element(),
                             })
-                            .child(row.name.clone())
-                            .into_any_element()
+                            .child(row.name.clone());
+                        td_cell(content, false)
                     }
                     // Numeric cells right-align to match their headers.
-                    "pid" => num_td(row.pid_s.clone()),
-                    "user" => row.user_s.clone().into_any_element(),
-                    "cpu" => num_td(row.cpu_s.clone()),
-                    "gpu" => num_td(row.gpu_s.clone()),
-                    "mem" => num_td(row.mem_s.clone()),
-                    "disk" => num_td(row.disk_s.clone()),
-                    "net" => num_td(row.net_s.clone()),
-                    "threads" => num_td(row.threads_s.clone()),
-                    "handles" => num_td(row.handles_s.clone()),
-                    _ => row.exe_s.clone().into_any_element(),
+                    "pid" => td_cell(row.pid_s.clone(), true),
+                    "user" => td_cell(row.user_s.clone(), false),
+                    "cpu" => td_cell(row.cpu_s.clone(), true),
+                    "gpu" => td_cell(row.gpu_s.clone(), true),
+                    "mem" => td_cell(row.mem_s.clone(), true),
+                    "disk" => td_cell(row.disk_s.clone(), true),
+                    "net" => td_cell(row.net_s.clone(), true),
+                    "threads" => td_cell(row.threads_s.clone(), true),
+                    "handles" => td_cell(row.handles_s.clone(), true),
+                    "parent" => td_cell(row.parent_s.clone(), true),
+                    "session" => td_cell(row.session_s.clone(), true),
+                    "start" => td_cell(row.start_s.clone(), false),
+                    "cmdline" => td_cell(row.cmdline_s.clone(), false),
+                    "company" => td_cell(row.company_s.clone(), false),
+                    "path" => td_cell(row.path_s.clone(), false),
+                    "cpuk" => td_cell(row.cpuk_s.clone(), true),
+                    "cpuu" => td_cell(row.cpuu_s.clone(), true),
+                    "cputime" => td_cell(row.cputime_s.clone(), true),
+                    "priority" => td_cell(row.priority_s.clone(), true),
+                    "commit" => td_cell(row.commit_s.clone(), true),
+                    "ws" => td_cell(row.ws_s.clone(), true),
+                    "wspeak" => td_cell(row.wspeak_s.clone(), true),
+                    "virt" => td_cell(row.virt_s.clone(), true),
+                    "faults" => td_cell(row.faults_s.clone(), true),
+                    "pagedpool" => td_cell(row.pagedpool_s.clone(), true),
+                    "npool" => td_cell(row.npool_s.clone(), true),
+                    "ioread" => td_cell(row.ioread_s.clone(), true),
+                    "iowrite" => td_cell(row.iowrite_s.clone(), true),
+                    _ => td_cell(row.exe_s.clone(), false),
                 }
             }
         }
@@ -666,6 +1025,7 @@ impl TableDelegate for ProcessTableDelegate {
         // aligned with visual positions.
         let col = self.columns.remove(col_ix);
         self.columns.insert(to_ix, col);
+        self.save_columns();
     }
 
     fn render_header(
@@ -705,12 +1065,16 @@ impl TableDelegate for ProcessTableDelegate {
             _ => None,
         };
         let right_aligned = !Self::is_text_column(key.as_ref());
+        let table = cx.entity();
         div()
             .id(("proc-th", col_ix))
             .size_full()
             .flex()
             .flex_col()
             .justify_center()
+            .pl(px(8.))
+            .border_r_1()
+            .border_color(rgb(COL_SEPARATOR))
             .when(right_aligned, |d| d.items_end())
             .cursor_pointer()
             .on_click(cx.listener(move |state, _, _, cx| {
@@ -719,6 +1083,47 @@ impl TableDelegate for ProcessTableDelegate {
             }))
             .child(format!("{name}{indicator}"))
             .when_some(total, |d, total| d.child(total))
+            // Right-click: the column picker, grouped by category.
+            .context_menu(move |menu, _window, _cx| {
+                let mut menu = menu.scrollable(true).max_h(px(700.));
+                {
+                    let table = table.clone();
+                    menu = menu.item(PopupMenuItem::new("Reset to default").on_click(
+                        move |_, _, cx| {
+                            table.update(cx, |state, cx| {
+                                state.delegate_mut().reset_columns();
+                                state.refresh(cx);
+                                cx.notify();
+                            });
+                        },
+                    ));
+                }
+                let mut last_category = "";
+                for spec in COLUMN_CATALOG {
+                    if spec.category != last_category {
+                        last_category = spec.category;
+                        menu = menu.separator().label(spec.category);
+                    }
+                    let checked = table.read_with(_cx, |state, _| {
+                        state.delegate().has_column(spec.key)
+                    });
+                    let table = table.clone();
+                    let key = spec.key;
+                    menu = menu.item(
+                        PopupMenuItem::new(spec.name)
+                            .checked(checked)
+                            .disabled(key == "name")
+                            .on_click(move |_, _, cx| {
+                                table.update(cx, |state, cx| {
+                                    state.delegate_mut().toggle_column(key);
+                                    state.refresh(cx);
+                                    cx.notify();
+                                });
+                            }),
+                    );
+                }
+                menu
+            })
     }
 
     fn context_menu(

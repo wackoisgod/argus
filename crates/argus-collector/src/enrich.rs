@@ -29,6 +29,12 @@ use windows_sys::Win32::System::Threading::{
 pub struct Enriched {
     pub user: Arc<str>,
     pub description: Arc<str>,
+    /// CompanyName from the version resource.
+    pub company: Arc<str>,
+    /// DOS path of the executable image.
+    pub image_path: Arc<str>,
+    /// Full command line; empty when the process can't be opened.
+    pub command_line: Arc<str>,
     /// The exe's shell icon, PNG-encoded.
     pub icon_png: Option<Arc<Vec<u8>>>,
     /// Image lives under %SystemRoot% (or is a pathless kernel process) —
@@ -106,6 +112,8 @@ impl Default for Enricher {
 fn resolve(pid: u32, wts: &Mutex<WtsUsers>) -> Enriched {
     let mut user: Arc<str> = Arc::from("");
     let mut description: Arc<str> = Arc::from("");
+    let mut company: Arc<str> = Arc::from("");
+    let mut command_line: Arc<str> = Arc::from("");
     let mut exe_path: Option<Vec<u16>> = None;
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
@@ -115,6 +123,9 @@ fn resolve(pid: u32, wts: &Mutex<WtsUsers>) -> Enriched {
             if QueryFullProcessImageNameW(handle, 0, path.as_mut_ptr(), &mut len) != 0 && len > 0
             {
                 exe_path = Some(path[..len as usize].to_vec());
+            }
+            if let Some(cl) = process_command_line(handle) {
+                command_line = cl;
             }
             let mut token: HANDLE = std::ptr::null_mut();
             if OpenProcessToken(handle, TOKEN_QUERY, &mut token) != 0 {
@@ -134,8 +145,12 @@ fn resolve(pid: u32, wts: &Mutex<WtsUsers>) -> Enriched {
     }
     let mut icon_png = None;
     if let Some(path) = &exe_path {
-        if let Some(d) = unsafe { file_description(path) } {
+        let (d, c) = unsafe { version_strings(path) };
+        if let Some(d) = d {
             description = d;
+        }
+        if let Some(c) = c {
+            company = c;
         }
         let mut pathz = path.clone();
         pathz.push(0);
@@ -154,11 +169,76 @@ fn resolve(pid: u32, wts: &Mutex<WtsUsers>) -> Enriched {
         // Secure System, Memory Compression).
         None => true,
     };
+    let image_path: Arc<str> = exe_path
+        .as_deref()
+        .map(|p| Arc::from(String::from_utf16_lossy(p)))
+        .unwrap_or_else(|| Arc::from(""));
     Enriched {
         user,
         description,
+        company,
+        image_path,
+        command_line,
         icon_png,
         windows_process,
+    }
+}
+
+/// Full command line via NtQueryInformationProcess's
+/// ProcessCommandLineInformation — works unelevated for same-user processes
+/// on Win 8.1+, no PEB reading needed.
+unsafe fn process_command_line(handle: HANDLE) -> Option<Arc<str>> {
+    #[link(name = "ntdll")]
+    extern "system" {
+        fn NtQueryInformationProcess(
+            handle: HANDLE,
+            class: u32,
+            info: *mut core::ffi::c_void,
+            len: u32,
+            ret_len: *mut u32,
+        ) -> i32;
+    }
+    const PROCESS_COMMAND_LINE_INFORMATION: u32 = 60;
+    let mut needed = 0u32;
+    NtQueryInformationProcess(
+        handle,
+        PROCESS_COMMAND_LINE_INFORMATION,
+        std::ptr::null_mut(),
+        0,
+        &mut needed,
+    );
+    if needed == 0 || needed > 64 * 1024 {
+        return None;
+    }
+    let mut buf = vec![0u8; needed as usize];
+    if NtQueryInformationProcess(
+        handle,
+        PROCESS_COMMAND_LINE_INFORMATION,
+        buf.as_mut_ptr().cast(),
+        needed,
+        &mut needed,
+    ) < 0
+    {
+        return None;
+    }
+    // Buffer holds a UNICODE_STRING header followed by the characters.
+    #[repr(C)]
+    struct UnicodeString {
+        length: u16,
+        maximum_length: u16,
+        buffer: *const u16,
+    }
+    let us = &*(buf.as_ptr() as *const UnicodeString);
+    if us.buffer.is_null() || us.length == 0 {
+        return None;
+    }
+    let chars = std::slice::from_raw_parts(us.buffer, us.length as usize / 2);
+    let s = String::from_utf16_lossy(chars);
+    let s = s.trim();
+    if s.is_empty() {
+        None
+    } else {
+        Some(Arc::from(s))
     }
 }
 
@@ -264,17 +344,18 @@ unsafe fn wts_refresh(map: &mut FxHashMap<u32, Arc<str>>) {
 }
 
 /// Read FileDescription from the executable's version resource.
-unsafe fn file_description(path: &[u16]) -> Option<Arc<str>> {
+/// (FileDescription, CompanyName) from one version-resource load.
+unsafe fn version_strings(path: &[u16]) -> (Option<Arc<str>>, Option<Arc<str>>) {
     let mut pathz = path.to_vec();
     pathz.push(0);
     let mut ignored = 0u32;
     let size = GetFileVersionInfoSizeW(pathz.as_ptr(), &mut ignored);
     if size == 0 {
-        return None;
+        return (None, None);
     }
     let mut data = vec![0u8; size as usize];
     if GetFileVersionInfoW(pathz.as_ptr(), 0, size, data.as_mut_ptr().cast()) == 0 {
-        return None;
+        return (None, None);
     }
 
     let mut ptr: *mut core::ffi::c_void = std::ptr::null_mut();
@@ -290,23 +371,28 @@ unsafe fn file_description(path: &[u16]) -> Option<Arc<str>> {
         lang = *words;
         cp = *words.add(1);
     }
-    let q = format!("\\StringFileInfo\\{lang:04X}{cp:04X}\\FileDescription");
-    let qw: Vec<u16> = q.encode_utf16().chain([0]).collect();
-    if VerQueryValueW(data.as_ptr().cast(), qw.as_ptr(), &mut ptr, &mut vlen) == 0
-        || ptr.is_null()
-        || vlen == 0
-    {
-        return None;
-    }
-    let slice = std::slice::from_raw_parts(ptr as *const u16, vlen as usize);
-    let end = slice.iter().position(|&c| c == 0).unwrap_or(slice.len());
-    let s = String::from_utf16_lossy(&slice[..end]);
-    let s = s.trim();
-    if s.is_empty() {
-        None
-    } else {
-        Some(Arc::from(s))
-    }
+    let query = |name: &str| -> Option<Arc<str>> {
+        let mut ptr: *mut core::ffi::c_void = std::ptr::null_mut();
+        let mut vlen = 0u32;
+        let q = format!("\\StringFileInfo\\{lang:04X}{cp:04X}\\{name}");
+        let qw: Vec<u16> = q.encode_utf16().chain([0]).collect();
+        if VerQueryValueW(data.as_ptr().cast(), qw.as_ptr(), &mut ptr, &mut vlen) == 0
+            || ptr.is_null()
+            || vlen == 0
+        {
+            return None;
+        }
+        let slice = std::slice::from_raw_parts(ptr as *const u16, vlen as usize);
+        let end = slice.iter().position(|&c| c == 0).unwrap_or(slice.len());
+        let s = String::from_utf16_lossy(&slice[..end]);
+        let s = s.trim();
+        if s.is_empty() {
+            None
+        } else {
+            Some(Arc::from(s))
+        }
+    };
+    (query("FileDescription"), query("CompanyName"))
 }
 
 /// Resolve the token's user SID to an account name.
