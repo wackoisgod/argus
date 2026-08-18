@@ -1243,10 +1243,14 @@ fn spawn_sampler() -> futures::channel::mpsc::Receiver<Snapshot> {
             let mut sampler = Sampler::new();
             sampler.sample(); // baseline for deltas
             // Immediate snapshot (rates read 0) so the first frame has rows,
-            // then a short-delta snapshot for real rates, then the loop.
+            // then a short-delta snapshot for real rates, then two pickup
+            // ticks that surface the async enrichment wave (names, users,
+            // icons) as it lands instead of waiting for the 1s cadence.
             let _ = tx.try_send(sampler.sample());
-            std::thread::sleep(Duration::from_millis(150));
-            let _ = tx.try_send(sampler.sample());
+            for wait in [150, 350, 500] {
+                std::thread::sleep(Duration::from_millis(wait));
+                let _ = tx.try_send(sampler.sample());
+            }
             let mut hwnd: isize = 0;
             let mut was_minimized = false;
             loop {

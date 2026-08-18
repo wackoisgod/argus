@@ -65,8 +65,16 @@ pub struct Enricher {
 
 impl Enricher {
     pub fn new() -> Self {
+        // Sized for the startup burst: every process on the system enriches
+        // at once on first sight, and users notice how long names/users/
+        // icons take to fill in. Idle rayon threads cost nothing afterward,
+        // and below-normal priority keeps the burst off the foreground.
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .clamp(4, 16);
         let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(2)
+            .num_threads(threads)
             .thread_name(|i| format!("enrich-{i}"))
             .start_handler(|_| unsafe {
                 // Enrichment is cosmetic; never compete with foreground work.
