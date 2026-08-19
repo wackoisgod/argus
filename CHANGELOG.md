@@ -6,6 +6,12 @@ All notable changes to Argus are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Multi-select in the process table: click selects, Ctrl+click toggles,
+  Shift+click extends a range. Right-click shows "End N Tasks" / "Copy
+  PIDs" / "Copy Names" for the whole selection (right-clicking outside the
+  selection retargets it, matching standard multi-select behavior).
+
 ## [0.2.0] - 2026-08-18
 
 ### Added

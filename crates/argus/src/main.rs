@@ -300,8 +300,13 @@ struct ProcessTableDelegate {
     sort: Option<(SharedString, bool)>,
     /// Lowercased needle matched against name/user/description/PID.
     filter: String,
-    /// Row the open context menu refers to: (pid, name).
-    menu_row: Option<(u32, SharedString)>,
+    /// Rows the open context menu refers to: (pid, name) per target.
+    menu_rows: Vec<(u32, SharedString)>,
+    /// Multi-selected pids (plain/ctrl/shift click), pruned to live
+    /// processes each snapshot.
+    selected: rustc_hash::FxHashSet<u32>,
+    /// Anchor pid for shift-range selection.
+    sel_anchor: Option<u32>,
     /// Collapse state for the Apps/Background/Windows sections.
     collapsed: [bool; 3],
     /// Group keys (app-root pid or section:name) whose members are shown.
@@ -322,7 +327,9 @@ impl ProcessTableDelegate {
             rows: Vec::new(),
             sort: Some(("pid".into(), true)),
             filter: String::new(),
-            menu_row: None,
+            menu_rows: Vec::new(),
+            selected: rustc_hash::FxHashSet::default(),
+            sel_anchor: None,
             collapsed: [false; 3],
             expanded: rustc_hash::FxHashSet::default(),
         }
@@ -546,6 +553,9 @@ impl ProcessTableDelegate {
             .filter_map(|r| r.icon.as_ref().map(|b| std::sync::Arc::as_ptr(b) as usize))
             .collect();
         self.icon_cache.retain(|identity, _| live.contains(identity));
+        let live_pids: rustc_hash::FxHashSet<u32> =
+            self.all_rows.iter().map(|r| r.pid).collect();
+        self.selected.retain(|pid| live_pids.contains(pid));
         self.rebuild_view();
     }
 
@@ -843,6 +853,53 @@ impl ProcessTableDelegate {
             }
         }
         self.rows = rows;
+    }
+
+    fn row_pid(&self, row_ix: usize) -> Option<u32> {
+        match self.rows.get(row_ix) {
+            Some(Row::Proc { row, .. }) => Some(row.pid),
+            _ => None,
+        }
+    }
+
+    fn select_only(&mut self, pid: u32) {
+        self.selected.clear();
+        self.selected.insert(pid);
+        self.sel_anchor = Some(pid);
+    }
+
+    fn toggle_select(&mut self, pid: u32) {
+        if !self.selected.insert(pid) {
+            self.selected.remove(&pid);
+        }
+        self.sel_anchor = Some(pid);
+    }
+
+    /// Shift-click: select every process row between the anchor and the
+    /// clicked row in the current visible order. The anchor stays put so
+    /// repeated shift-clicks re-extend from the same origin.
+    fn select_range_to(&mut self, row_ix: usize) {
+        let Some(clicked) = self.row_pid(row_ix) else {
+            return;
+        };
+        let anchor_ix = self
+            .sel_anchor
+            .and_then(|a| {
+                self.rows.iter().position(
+                    |r| matches!(r, Row::Proc { row, .. } if row.pid == a),
+                )
+            })
+            .unwrap_or(row_ix);
+        let (lo, hi) = (anchor_ix.min(row_ix), anchor_ix.max(row_ix));
+        self.selected.clear();
+        for r in &self.rows[lo..=hi] {
+            if let Row::Proc { row, .. } = r {
+                self.selected.insert(row.pid);
+            }
+        }
+        if self.sel_anchor.is_none() {
+            self.sel_anchor = Some(clicked);
+        }
     }
 
     fn sort_procs(&self, procs: &mut [ProcRow]) {
@@ -1161,23 +1218,92 @@ impl TableDelegate for ProcessTableDelegate {
             })
     }
 
+    fn render_tr(
+        &mut self,
+        row_ix: usize,
+        _window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let mut tr = div().id(("row", row_ix));
+        let Some(pid) = self.row_pid(row_ix) else {
+            return tr;
+        };
+        if self.selected.contains(&pid) {
+            tr = tr.bg(rgb(0x2d3050));
+        }
+        tr.on_mouse_down(
+            gpui::MouseButton::Left,
+            cx.listener(move |state, e: &gpui::MouseDownEvent, _, cx| {
+                let d = state.delegate_mut();
+                if e.modifiers.shift {
+                    d.select_range_to(row_ix);
+                } else if e.modifiers.control {
+                    d.toggle_select(pid);
+                } else {
+                    d.select_only(pid);
+                }
+                cx.notify();
+            }),
+        )
+    }
+
     fn context_menu(
         &mut self,
         row_ix: usize,
         menu: PopupMenu,
         _window: &mut Window,
-        _cx: &mut Context<TableState<Self>>,
+        cx: &mut Context<TableState<Self>>,
     ) -> PopupMenu {
-        let Some(Row::Proc { row, .. }) = self.rows.get(row_ix) else {
-            return menu;
+        let (pid, name) = match self.rows.get(row_ix) {
+            Some(Row::Proc { row, .. }) => (row.pid, row.name.clone()),
+            _ => return menu,
         };
-        self.menu_row = Some((row.pid, row.name.clone()));
-        menu.label(format!("{}  ({})", row.name, row.pid))
+        // Right-click outside the current selection retargets it to the
+        // clicked row (standard multi-select behavior); inside it, the
+        // whole selection becomes the menu's target.
+        if !self.selected.contains(&pid) {
+            self.select_only(pid);
+            cx.notify();
+        }
+        // Targets: the selection in visible order (deduped — aggregated
+        // group rows share the root pid), or just the clicked row.
+        let mut seen = rustc_hash::FxHashSet::default();
+        let mut targets: Vec<(u32, SharedString)> = self
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Proc { row, .. }
+                    if self.selected.contains(&row.pid) && seen.insert(row.pid) =>
+                {
+                    Some((row.pid, row.name.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        if targets.is_empty() {
+            targets = vec![(pid, name)];
+        }
+        let n = targets.len();
+        let title: SharedString = if n == 1 {
+            format!("{}  ({})", targets[0].1, targets[0].0).into()
+        } else {
+            format!("{n} processes selected").into()
+        };
+        let end_label: SharedString = if n == 1 {
+            "End Task".into()
+        } else {
+            format!("End {n} Tasks").into()
+        };
+        self.menu_rows = targets;
+        menu.label(title)
             .separator()
-            .menu("End Task", Box::new(EndTask))
+            .menu(end_label, Box::new(EndTask))
             .separator()
-            .menu("Copy PID", Box::new(CopyPid))
-            .menu("Copy Name", Box::new(CopyName))
+            .menu(if n == 1 { "Copy PID" } else { "Copy PIDs" }, Box::new(CopyPid))
+            .menu(
+                if n == 1 { "Copy Name" } else { "Copy Names" },
+                Box::new(CopyName),
+            )
     }
 
 }
@@ -1374,17 +1500,31 @@ impl TaskManagerApp {
         }
     }
 
-    fn menu_row(&self, cx: &App) -> Option<(u32, SharedString)> {
-        self.table.read(cx).delegate().menu_row.clone()
+    fn menu_rows(&self, cx: &App) -> Vec<(u32, SharedString)> {
+        self.table.read(cx).delegate().menu_rows.clone()
     }
 
     fn end_task(&mut self, cx: &mut Context<Self>) {
-        let Some((pid, name)) = self.menu_row(cx) else {
+        let targets = self.menu_rows(cx);
+        if targets.is_empty() {
             return;
-        };
-        self.status = Some(match argus_collector::kill_process(pid) {
-            Ok(()) => format!("Ended {name} ({pid})").into(),
-            Err(e) => format!("Could not end {name} ({pid}): {e}").into(),
+        }
+        let mut ended = 0usize;
+        let mut failures: Vec<String> = Vec::new();
+        for (pid, name) in &targets {
+            match argus_collector::kill_process(*pid) {
+                Ok(()) => ended += 1,
+                Err(e) => failures.push(format!("{name} ({pid}): {e}")),
+            }
+        }
+        self.status = Some(match (&targets[..], &failures[..]) {
+            ([(pid, name)], []) => format!("Ended {name} ({pid})").into(),
+            (_, []) => format!("Ended {ended} tasks").into(),
+            ([(pid, name)], [err]) => {
+                let _ = (pid, name);
+                format!("Could not end {err}").into()
+            }
+            _ => format!("Ended {ended} tasks; failed: {}", failures.join(", ")).into(),
         });
         cx.notify();
     }
@@ -1489,13 +1629,19 @@ impl Render for TaskManagerApp {
             .text_size(px(13.))
             .on_action(cx.listener(|this, _: &EndTask, _, cx| this.end_task(cx)))
             .on_action(cx.listener(|this, _: &CopyPid, _, cx| {
-                if let Some((pid, _)) = this.menu_row(cx) {
-                    this.copy_to_clipboard(pid.to_string(), cx);
+                let rows = this.menu_rows(cx);
+                if !rows.is_empty() {
+                    let pids: Vec<String> =
+                        rows.iter().map(|(pid, _)| pid.to_string()).collect();
+                    this.copy_to_clipboard(pids.join(", "), cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &CopyName, _, cx| {
-                if let Some((_, name)) = this.menu_row(cx) {
-                    this.copy_to_clipboard(name.to_string(), cx);
+                let rows = this.menu_rows(cx);
+                if !rows.is_empty() {
+                    let names: Vec<String> =
+                        rows.iter().map(|(_, name)| name.to_string()).collect();
+                    this.copy_to_clipboard(names.join(", "), cx);
                 }
             }))
             .child(tab_bar)
