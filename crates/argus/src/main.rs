@@ -24,6 +24,12 @@ actions!(tm, [EndTask, CopyPid, CopyName]);
 
 static START: OnceLock<Instant> = OnceLock::new();
 
+/// Which tab is visible (0 = Processes, 1 = Performance), for the sampler
+/// thread: adapter-wide GPU probing relaxes to every other tick while the
+/// Performance tab isn't showing, since each D3DKMT query can stall inside
+/// the display driver.
+static CURRENT_TAB: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
 /// Startup timing to stderr; invisible in normal use, `tm-app 2>log` to see.
 fn tlog(label: &str) {
     let start = *START.get_or_init(Instant::now);
@@ -1379,7 +1385,9 @@ fn spawn_sampler() -> futures::channel::mpsc::Receiver<Snapshot> {
             }
             let mut hwnd: isize = 0;
             let mut was_minimized = false;
+            let mut tick: u64 = 0;
             loop {
+                tick += 1;
                 let minimized = window_minimized(&mut hwnd);
                 let interval = if minimized { 2500 } else { 1000 };
                 // Sleep in slices so a restore is noticed within 250ms and
@@ -1405,7 +1413,9 @@ fn spawn_sampler() -> futures::channel::mpsc::Receiver<Snapshot> {
                     unsafe { K32EmptyWorkingSet(GetCurrentProcess()) };
                 }
                 was_minimized = still_minimized;
-                match tx.try_send(sampler.sample_with(still_minimized)) {
+                let gpu_relaxed = CURRENT_TAB.load(std::sync::atomic::Ordering::Relaxed) == 0
+                    && tick % 2 == 1;
+                match tx.try_send(sampler.sample_with_opts(still_minimized, gpu_relaxed)) {
                     Err(e) if e.is_disconnected() => break,
                     _ => {}
                 }
@@ -1591,6 +1601,7 @@ impl Render for TaskManagerApp {
                 })
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.tab = id;
+                    CURRENT_TAB.store(id, std::sync::atomic::Ordering::Relaxed);
                     cx.notify();
                 }))
                 .child(label)

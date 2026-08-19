@@ -155,6 +155,15 @@ impl Sampler {
     /// minimized, where nobody sees those columns. Rate math stays correct
     /// across the gap because GPU deltas carry their own timestamps.
     pub fn sample_with(&mut self, light: bool) -> Snapshot {
+        self.sample_with_opts(light, false)
+    }
+
+    /// `gpu_relaxed` reuses the previous tick's adapter-wide GPU data
+    /// (engines, VRAM, temperature) instead of re-probing the driver — every
+    /// D3DKMT query can stall the CPU inside the display driver, and while
+    /// the Performance tab isn't visible nobody needs 1s-fresh engine data.
+    /// Per-process GPU attribution still samples every tick.
+    pub fn sample_with_opts(&mut self, light: bool, gpu_relaxed: bool) -> Snapshot {
         let now = Instant::now();
         let elapsed = self
             .prev_tick
@@ -283,7 +292,11 @@ impl Sampler {
         let perf = if light {
             PerfInfo::default()
         } else {
-            let gpus = self.gpu.adapters_perf();
+            let gpus = if gpu_relaxed {
+                self.gpu.last_perf()
+            } else {
+                self.gpu.adapters_perf()
+            };
             self.perf.sample(gpus)
         };
 

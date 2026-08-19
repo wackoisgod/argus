@@ -6,6 +6,12 @@ All notable changes to Argus are documented here. The format follows
 
 ## [Unreleased]
 
+### Performance
+- Adapter-wide GPU probing (engines, VRAM, temperature) relaxes to every
+  other tick while the Performance tab isn't visible — each D3DKMT query can
+  stall inside the display driver. Per-process GPU attribution still samples
+  every second.
+
 ### Added
 - Multi-select in the process table: click selects, Ctrl+click toggles,
   Shift+click extends a range. Right-click shows "End N Tasks" / "Copy

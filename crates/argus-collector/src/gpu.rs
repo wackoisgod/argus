@@ -129,6 +129,9 @@ pub struct GpuMonitor {
     mem_temp_cache: Vec<(u64, u64, u64, u64, Option<f32>)>,
     perf_tick: u32,
     tick: u32,
+    /// Last adapters_perf result, for ticks that reuse it instead of
+    /// re-probing the driver.
+    last_perf: Vec<GpuAdapterPerf>,
 }
 
 fn zeroed_stats() -> QueryStats {
@@ -164,6 +167,7 @@ impl GpuMonitor {
             mem_temp_cache: vec![(0, 0, 0, 0, None); adapter_count],
             perf_tick: 0,
             tick: 0,
+            last_perf: Vec::new(),
         }
     }
 
@@ -274,7 +278,13 @@ impl GpuMonitor {
             perf.temperature_c = temp;
             out.push(perf);
         }
+        self.last_perf = out.clone();
         out
+    }
+
+    /// The previous `adapters_perf` result without touching the driver.
+    pub fn last_perf(&self) -> Vec<GpuAdapterPerf> {
+        self.last_perf.clone()
     }
 
     /// Total cumulative GPU running time for one process, summed across all
