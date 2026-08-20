@@ -62,6 +62,30 @@ fn td_cell(content: impl gpui::IntoElement, right: bool) -> gpui::AnyElement {
         .into_any_element()
 }
 
+/// Power-usage cell: Task Manager-style heat tint scaling with the level.
+fn power_td(label: gpui::SharedString, level: u8) -> gpui::AnyElement {
+    const TINTS: [u32; 5] = [
+        0x89b4fa00, // Very low: no tint
+        0x89b4fa1c, // Low
+        0x89b4fa34, // Moderate
+        0x89b4fa55, // High
+        0x89b4fa7a, // Very high
+    ];
+    div()
+        .w_full()
+        .h_full()
+        .px(px(8.))
+        .flex()
+        .items_center()
+        .justify_end()
+        .border_r_1()
+        .border_color(rgb(COL_SEPARATOR))
+        .overflow_hidden()
+        .bg(gpui::rgba(TINTS[level.min(4) as usize]))
+        .child(label)
+        .into_any_element()
+}
+
 fn fmt_mibs(bytes_per_sec: u64) -> String {
     format!("{:.2} MiB/s", bytes_per_sec as f64 / (1024.0 * 1024.0))
 }
@@ -120,6 +144,7 @@ const COLUMN_CATALOG: &[ColSpec] = &[
     col("CPU", "cpuu", "CPU (user)", 100., true, false),
     col("CPU", "cputime", "CPU time", 110., true, false),
     col("CPU", "priority", "Priority", 80., true, false),
+    col("CPU", "power", "Power usage", 110., true, true),
     col("Memory", "mem", "Memory", 110., true, true),
     col("Memory", "commit", "Commit size", 110., true, false),
     col("Memory", "ws", "Working set", 110., true, false),
@@ -140,7 +165,8 @@ const COLUMN_CATALOG: &[ColSpec] = &[
 /// Default layout (order matters — this is the classic arrangement, not
 /// catalog order).
 const DEFAULT_COLUMNS: &[&str] = &[
-    "name", "pid", "user", "cpu", "gpu", "mem", "disk", "net", "threads", "handles", "exe",
+    "name", "pid", "user", "cpu", "gpu", "power", "mem", "disk", "net", "threads", "handles",
+    "exe",
 ];
 
 fn col_spec(key: &str) -> Option<&'static ColSpec> {
@@ -194,6 +220,10 @@ struct ProcRow {
     threads_s: SharedString,
     handles: u32,
     handles_s: SharedString,
+    /// Power estimate: blended resource score and its 0..=4 bucket.
+    power: f32,
+    power_lvl: u8,
+    power_s: SharedString,
     // Optional-column data (hidden by default; toggled via the header menu).
     parent_s: SharedString,
     session_s: SharedString,
@@ -253,6 +283,23 @@ fn fmt_start_time(create: i64) -> String {
             "{:02}:{:02}:{:02} {:04}-{:02}-{:02}",
             lt.wHour, lt.wMinute, lt.wSecond, lt.wYear, lt.wMonth, lt.wDay
         )
+    }
+}
+
+/// Task Manager-style power estimate: a weighted blend of the resources
+/// that dominate package power draw.
+fn power_score(cpu_pct: f32, gpu_pct: f32, disk_bps: u64) -> f32 {
+    cpu_pct + 0.7 * gpu_pct + disk_bps as f32 / (1024.0 * 1024.0) * 0.3
+}
+
+/// Bucket a power score into Task Manager's five levels: (0..=4, label).
+fn power_bucket(score: f32) -> (u8, &'static str) {
+    match score {
+        s if s < 0.8 => (0, "Very low"),
+        s if s < 4.0 => (1, "Low"),
+        s if s < 12.0 => (2, "Moderate"),
+        s if s < 30.0 => (3, "High"),
+        _ => (4, "Very high"),
     }
 }
 
@@ -476,6 +523,8 @@ impl ProcessTableDelegate {
                 .unwrap_or_default();
             let cputime = p.raw.user_time_100ns + p.raw.kernel_time_100ns;
             let user_pct = (p.cpu_percent - p.kernel_percent).max(0.0);
+            let power = power_score(p.cpu_percent, p.gpu_percent, p.disk_bytes_per_sec);
+            let (power_lvl, power_label) = power_bucket(power);
             let exe = p.raw.name.to_string();
             self.all_rows.push(ProcRow {
                 name: if desc.is_empty() {
@@ -507,6 +556,9 @@ impl ProcessTableDelegate {
                 threads_s: p.raw.threads.to_string().into(),
                 handles: p.raw.handles,
                 handles_s: p.raw.handles.to_string().into(),
+                power,
+                power_lvl,
+                power_s: power_label.into(),
                 parent_s: s(w_parent, &|| p.raw.parent_pid.to_string()),
                 session_s: s(w_session, &|| p.raw.session_id.to_string()),
                 start_s: s(w_start, &|| fmt_start_time(p.raw.create_time)),
@@ -660,7 +712,11 @@ impl ProcessTableDelegate {
             agg.npool += c.npool;
             agg.ioread += c.ioread;
             agg.iowrite += c.iowrite;
+            agg.power += c.power;
         }
+        let (lvl, label) = power_bucket(agg.power);
+        agg.power_lvl = lvl;
+        agg.power_s = label.into();
         agg.cpu_s = format!("{:.1}%", agg.cpu).into();
         agg.gpu_s = format!("{:.1}%", agg.gpu).into();
         agg.mem_s = fmt_bytes(agg.mem).into();
@@ -942,6 +998,7 @@ impl ProcessTableDelegate {
                 "parent" => a.parent.cmp(&b.parent),
                 "session" => a.session.cmp(&b.session),
                 "start" => a.create.cmp(&b.create),
+                "power" => a.power.total_cmp(&b.power),
                 "cpuk" => a.cpuk.total_cmp(&b.cpuk),
                 "cpuu" => a.cpuu.total_cmp(&b.cpuu),
                 "cputime" => a.cputime.cmp(&b.cputime),
@@ -1093,6 +1150,7 @@ impl TableDelegate for ProcessTableDelegate {
                     "cmdline" => td_cell(row.cmdline_s.clone(), false),
                     "company" => td_cell(row.company_s.clone(), false),
                     "path" => td_cell(row.path_s.clone(), false),
+                    "power" => power_td(row.power_s.clone(), row.power_lvl),
                     "cpuk" => td_cell(row.cpuk_s.clone(), true),
                     "cpuu" => td_cell(row.cpuu_s.clone(), true),
                     "cputime" => td_cell(row.cputime_s.clone(), true),

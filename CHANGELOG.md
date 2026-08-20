@@ -13,6 +13,10 @@ All notable changes to Argus are documented here. The format follows
   every second.
 
 ### Added
+- Power usage column (default-on, between GPU and Memory): Task Manager's
+  five levels from Very low to Very high, estimated from a weighted blend of
+  CPU, GPU, and disk activity, with a heat tint on the cell that scales with
+  the level. Sorts by the underlying score; group rows aggregate members.
 - Clear button (⊗) in the process filter box when it has text; Escape also
   clears it.
 - Multi-select in the process table: click selects, Ctrl+click toggles,
