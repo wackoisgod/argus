@@ -13,6 +13,8 @@ All notable changes to Argus are documented here. The format follows
   every second.
 
 ### Added
+- Clear button (⊗) in the process filter box when it has text; Escape also
+  clears it.
 - Multi-select in the process table: click selects, Ctrl+click toggles,
   Shift+click extends a range. Right-click shows "End N Tasks" / "Copy
   PIDs" / "Copy Names" for the whole selection (right-clicking outside the

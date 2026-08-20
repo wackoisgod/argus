@@ -1436,7 +1436,9 @@ impl TaskManagerApp {
         });
 
         let filter_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder("Filter by name, user, description, or PID")
+            InputState::new(window, cx)
+                .placeholder("Filter by name, user, description, or PID")
+                .clean_on_escape()
         });
         cx.subscribe(&filter_input, |this: &mut Self, input, ev: &InputEvent, cx| {
             if matches!(ev, InputEvent::Change) {
@@ -1576,7 +1578,11 @@ impl Render for TaskManagerApp {
             .px(px(8.))
             .py(px(6.))
             .bg(rgb(BG_HEADER))
-            .child(div().w(px(340.)).child(Input::new(&self.filter_input)))
+            .child(
+                div()
+                    .w(px(340.))
+                    .child(Input::new(&self.filter_input).cleanable(true)),
+            )
             .when_some(self.status.clone(), |this, status| {
                 this.child(div().text_color(rgb(TEXT_DIM)).child(status))
             });
@@ -1667,10 +1673,12 @@ struct ArgusAssets;
 
 impl gpui::AssetSource for ArgusAssets {
     fn load(&self, path: &str) -> gpui::Result<Option<std::borrow::Cow<'static, [u8]>>> {
-        // Lucide "check", matching the icon set gpui-component targets.
+        // Lucide icons, matching the icon set gpui-component targets.
         const CHECK_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>"##;
+        const CIRCLE_X_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="m15 9-6 6"/><path d="m9 9 6 6"/></svg>"##;
         Ok(match path {
             "icons/check.svg" => Some(std::borrow::Cow::Borrowed(CHECK_SVG)),
+            "icons/circle-x.svg" => Some(std::borrow::Cow::Borrowed(CIRCLE_X_SVG)),
             _ => None,
         })
     }
