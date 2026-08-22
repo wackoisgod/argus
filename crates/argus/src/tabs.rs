@@ -503,7 +503,14 @@ fn info_row(key: &'static str, value: &str) -> AnyElement {
                 .text_color(rgb(TEXT_DIM))
                 .child(format!("{key}:")),
         )
-        .child(div().text_color(rgb(TEXT)).child(value.to_string()))
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .overflow_hidden()
+                .text_color(rgb(TEXT))
+                .child(value.to_string()),
+        )
         .into_any_element()
 }
 
@@ -579,6 +586,10 @@ pub fn render_information(info: &SystemInformation, live: &LiveInfo) -> AnyEleme
         .flex_1()
         .min_h(px(0.))
         .flex()
+        // Columns keep their natural height — the default stretch aligns
+        // them to the container, which hides the overflow from the scroll
+        // container and kills wheel scrolling.
+        .items_start()
         .gap(px(24.))
         .p(px(16.))
         .overflow_y_scroll()

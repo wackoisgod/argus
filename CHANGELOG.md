@@ -6,6 +6,12 @@ All notable changes to Argus are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- Information tab scrolls when its content is taller than the window (the
+  columns were stretch-aligned to the container, hiding the overflow from
+  the scroll container), and long values wrap within their column instead
+  of bleeding into the next one.
+
 ### Performance
 - Interactive window resizing is far smoother: paints during the modal
   size/move loop are capped at ~30fps (the drag timer was forcing full
