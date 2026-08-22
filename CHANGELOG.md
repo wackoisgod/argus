@@ -6,6 +6,8 @@ All notable changes to Argus are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-22
+
 ### Fixed
 - Information tab scrolls when its content is taller than the window (the
   columns were stretch-aligned to the container, hiding the overflow from
@@ -133,6 +135,7 @@ Initial release.
 - Windows GUI binary with embedded Argus icon, GitHub Actions CI, and
   tag-driven releases.
 
-[Unreleased]: https://github.com/wackoisgod/argus/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/wackoisgod/argus/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/wackoisgod/argus/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/wackoisgod/argus/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/wackoisgod/argus/releases/tag/v0.1.0

@@ -112,7 +112,7 @@ dependencies = [
 
 [[package]]
 name = "argus"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "argus-collector",
  "futures",
@@ -125,7 +125,7 @@ dependencies = [
 
 [[package]]
 name = "argus-collector"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ferrisetw",
  "image",
