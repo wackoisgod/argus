@@ -373,7 +373,7 @@ unsafe fn wts_refresh(map: &mut FxHashMap<u32, Arc<str>>) {
 
 /// Read FileDescription from the executable's version resource.
 /// (FileDescription, CompanyName) from one version-resource load.
-unsafe fn version_strings(path: &[u16]) -> (Option<Arc<str>>, Option<Arc<str>>) {
+pub(crate) unsafe fn version_strings(path: &[u16]) -> (Option<Arc<str>>, Option<Arc<str>>) {
     let mut pathz = path.to_vec();
     pathz.push(0);
     let mut ignored = 0u32;

@@ -13,6 +13,21 @@ All notable changes to Argus are documented here. The format follows
   every second.
 
 ### Added
+- Four new tabs:
+  - **Services** — all Win32 services with display name, status, startup
+    type, PID, account, and image path; running/stopped counts in a footer.
+    Refreshes every ~3s while visible, idle otherwise.
+  - **Startup Apps** — registry Run keys (HKCU/HKLM/32-bit), startup
+    folders (.lnk targets resolved), and packaged-app StartupTask entries,
+    with Enabled/Disabled state from StartupApproved and publisher from
+    version resources. Queried on tab activation only.
+  - **Connections** — full TCP/UDP v4+v6 endpoint table with state, owning
+    PID, and process name; totals footer (TCP/UDP/EST/LISTEN). Refreshes
+    1Hz while visible.
+  - **Information** — OS identity, processor, system, volumes, memory
+    (with per-module SMBIOS data: slot, capacity, speed, type,
+    manufacturer, part number), and network adapters; static data gathered
+    once, live counters riding the existing sampler.
 - Power usage column (default-on, between GPU and Memory): Task Manager's
   five levels from Very low to Very high, estimated from a weighted blend of
   CPU, GPU, and disk activity, with a heat tint on the cell that scales with

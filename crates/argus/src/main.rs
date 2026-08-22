@@ -19,6 +19,7 @@ use gpui_component::Root;
 use argus_collector::{fmt_bytes, Sampler, Snapshot, SystemStats};
 
 mod perf_ui;
+mod tabs;
 
 actions!(tm, [EndTask, CopyPid, CopyName]);
 
@@ -36,18 +37,18 @@ fn tlog(label: &str) {
     eprintln!("[startup {:>10.1?}] {label}", start.elapsed());
 }
 
-const BG_HEADER: u32 = 0x1e1e2e;
-const TEXT: u32 = 0xcdd6f4;
-const TEXT_DIM: u32 = 0x7f849c;
-const ACCENT: u32 = 0x89b4fa;
+pub(crate) const BG_HEADER: u32 = 0x1e1e2e;
+pub(crate) const TEXT: u32 = 0xcdd6f4;
+pub(crate) const TEXT_DIM: u32 = 0x7f849c;
+pub(crate) const ACCENT: u32 = 0x89b4fa;
 
 /// Disk rates in fixed MiB/s, Task Manager style.
 /// Color of the vertical line between columns (body and header).
-const COL_SEPARATOR: u32 = 0x252539;
+pub(crate) const COL_SEPARATOR: u32 = 0x252539;
 
 /// Full-height cell wrapper: owns the padding (columns are declared p_0) and
 /// draws the column separator on its right edge.
-fn td_cell(content: impl gpui::IntoElement, right: bool) -> gpui::AnyElement {
+pub(crate) fn td_cell(content: impl gpui::IntoElement, right: bool) -> gpui::AnyElement {
     div()
         .w_full()
         .h_full()
@@ -1374,11 +1375,22 @@ impl TableDelegate for ProcessTableDelegate {
 
 struct TaskManagerApp {
     table: Entity<TableState<ProcessTableDelegate>>,
+    services_table: Entity<TableState<tabs::ServicesDelegate>>,
+    startup_table: Entity<TableState<tabs::StartupDelegate>>,
+    conn_table: Entity<TableState<tabs::ConnectionsDelegate>>,
+    /// UI-owned connection query; only touched while the tab is visible.
+    conn_query: argus_collector::ConnQuery,
+    /// Static system info, gathered on first Information-tab visit.
+    sysinfo: Option<argus_collector::SystemInformation>,
+    startup_loaded: bool,
+    /// Throttles the Services refresh to every few snapshot ticks.
+    services_tick: u32,
     filter_input: Entity<InputState>,
     sys: SystemStats,
     status: Option<SharedString>,
     first_snapshot: bool,
-    /// 0 = Processes, 1 = Performance.
+    /// 0 = Processes, 1 = Performance, 2 = Services, 3 = Startup Apps,
+    /// 4 = Connections, 5 = Information.
     tab: u8,
     pane: perf_ui::Pane,
     history: perf_ui::PerfHistory,
@@ -1492,6 +1504,15 @@ impl TaskManagerApp {
         let table = cx.new(|cx| {
             TableState::new(ProcessTableDelegate::new(), window, cx).col_selectable(false)
         });
+        let services_table = cx.new(|cx| {
+            TableState::new(tabs::ServicesDelegate::new(), window, cx).col_selectable(false)
+        });
+        let startup_table = cx.new(|cx| {
+            TableState::new(tabs::StartupDelegate::new(), window, cx).col_selectable(false)
+        });
+        let conn_table = cx.new(|cx| {
+            TableState::new(tabs::ConnectionsDelegate::new(), window, cx).col_selectable(false)
+        });
 
         let filter_input = cx.new(|cx| {
             InputState::new(window, cx)
@@ -1546,6 +1567,35 @@ impl TaskManagerApp {
                         state.delegate_mut().set_snapshot(&snap);
                         cx.notify();
                     });
+                    // Tab-local data: refreshed only while visible.
+                    match this.tab {
+                        2 => {
+                            this.services_tick = this.services_tick.wrapping_add(1);
+                            if this.services_tick % 3 == 1 {
+                                let services = argus_collector::query_services();
+                                this.services_table.update(cx, |state, cx| {
+                                    state.delegate_mut().set_services(&services);
+                                    cx.notify();
+                                });
+                            }
+                        }
+                        4 => {
+                            let conns = this.conn_query.connections();
+                            let names: rustc_hash::FxHashMap<u32, SharedString> = snap
+                                .processes
+                                .iter()
+                                .filter(|p| !p.raw.name.is_empty())
+                                .map(|p| {
+                                    (p.raw.pid, SharedString::from(p.raw.name.to_string()))
+                                })
+                                .collect();
+                            this.conn_table.update(cx, |state, cx| {
+                                state.delegate_mut().set_connections(&conns, &names);
+                                cx.notify();
+                            });
+                        }
+                        _ => {}
+                    }
                     cx.notify();
                 });
                 if alive.is_err() {
@@ -1557,6 +1607,13 @@ impl TaskManagerApp {
 
         Self {
             table,
+            services_table,
+            startup_table,
+            conn_table,
+            conn_query: argus_collector::ConnQuery::new(),
+            sysinfo: None,
+            startup_loaded: false,
+            services_tick: 0,
             filter_input,
             sys: SystemStats::default(),
             status: None,
@@ -1601,6 +1658,117 @@ impl TaskManagerApp {
 
     fn copy_to_clipboard(&mut self, text: String, cx: &mut Context<Self>) {
         cx.write_to_clipboard(ClipboardItem::new_string(text));
+    }
+
+    /// One-shot / immediate loads when a tab becomes visible, so switching
+    /// never shows an empty table waiting for the next sampler tick.
+    fn on_tab_activated(&mut self, id: u8, cx: &mut Context<Self>) {
+        match id {
+            2 => {
+                self.services_tick = 0;
+                let services = argus_collector::query_services();
+                self.services_table.update(cx, |state, cx| {
+                    state.delegate_mut().set_services(&services);
+                    cx.notify();
+                });
+            }
+            3 => {
+                // Startup apps change rarely; refresh on every activation
+                // (cheap) but never in the background.
+                let apps = argus_collector::query_startup_apps();
+                self.startup_loaded = true;
+                self.startup_table.update(cx, |state, cx| {
+                    state.delegate_mut().set_apps(&apps);
+                    cx.notify();
+                });
+            }
+            4 => {
+                let conns = self.conn_query.connections();
+                let names: rustc_hash::FxHashMap<u32, SharedString> = self
+                    .table
+                    .read(cx)
+                    .delegate()
+                    .all_rows
+                    .iter()
+                    .map(|r| (r.pid, r.exe_s.clone()))
+                    .collect();
+                self.conn_table.update(cx, |state, cx| {
+                    state.delegate_mut().set_connections(&conns, &names);
+                    cx.notify();
+                });
+            }
+            5 => {
+                if self.sysinfo.is_none() {
+                    self.sysinfo = Some(argus_collector::query_system_information());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn render_information(&self, _cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(info) = &self.sysinfo else {
+            return div()
+                .flex_1()
+                .p(px(16.))
+                .text_color(rgb(TEXT_DIM))
+                .child("Gathering system information…")
+                .into_any_element();
+        };
+        let perf = &self.history.latest;
+        let uptime = {
+            let secs = perf.uptime_secs;
+            let d = secs / 86400;
+            format!(
+                "{d}d {:02}:{:02}:{:02}",
+                (secs % 86400) / 3600,
+                (secs % 3600) / 60,
+                secs % 60
+            )
+        };
+        let adapters: Vec<argus_collector::Section> = perf
+            .adapters
+            .iter()
+            .map(|a| {
+                let mut section: argus_collector::Section = Vec::new();
+                section.push((
+                    "Name",
+                    format!(
+                        "{} ({})",
+                        a.name,
+                        if a.connected { "Connected" } else { "Disconnected" }
+                    ),
+                ));
+                if !a.ipv4.is_empty() {
+                    section.push(("IP Address", a.ipv4.to_string()));
+                }
+                if !a.ipv6.is_empty() {
+                    section.push(("IPv6 Address", a.ipv6.to_string()));
+                }
+                if !a.mac.is_empty() {
+                    section.push(("MAC Address", a.mac.to_string()));
+                }
+                section
+            })
+            .collect();
+        let live = tabs::LiveInfo {
+            uptime,
+            processes: self.sys.process_count,
+            threads: self.sys.thread_count,
+            handles: self.sys.handle_count,
+            mem_in_use: format!(
+                "{} / {}",
+                fmt_bytes(perf.mem.in_use),
+                fmt_bytes(perf.mem.total)
+            ),
+            commit: format!(
+                "{} / {}",
+                fmt_bytes(perf.mem.commit_used),
+                fmt_bytes(perf.mem.commit_limit)
+            ),
+            adapters,
+        };
+        tabs::render_information(info, &live)
     }
 }
 
@@ -1666,6 +1834,7 @@ impl Render for TaskManagerApp {
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.tab = id;
                     CURRENT_TAB.store(id, std::sync::atomic::Ordering::Relaxed);
+                    this.on_tab_activated(id, cx);
                     cx.notify();
                 }))
                 .child(label)
@@ -1677,10 +1846,14 @@ impl Render for TaskManagerApp {
             .px(px(8.))
             .bg(rgb(BG_HEADER))
             .child(tab(self, cx, 0, "Processes"))
-            .child(tab(self, cx, 1, "Performance"));
+            .child(tab(self, cx, 1, "Performance"))
+            .child(tab(self, cx, 2, "Services"))
+            .child(tab(self, cx, 3, "Startup Apps"))
+            .child(tab(self, cx, 4, "Connections"))
+            .child(tab(self, cx, 5, "Information"));
 
-        let body: gpui::AnyElement = if self.tab == 0 {
-            div()
+        let body: gpui::AnyElement = match self.tab {
+            0 => div()
                 .flex()
                 .flex_col()
                 .flex_1()
@@ -1692,9 +1865,79 @@ impl Render for TaskManagerApp {
                         .overflow_hidden()
                         .child(Table::new(&self.table).stripe(true)),
                 )
-                .into_any_element()
-        } else {
-            self.render_performance(cx)
+                .into_any_element(),
+            1 => self.render_performance(cx),
+            2 => {
+                let (running, stopped, total) = {
+                    let d = self.services_table.read(cx).delegate();
+                    (d.running, d.stopped, d.running + d.stopped)
+                };
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .flex_1()
+                            .overflow_hidden()
+                            .child(Table::new(&self.services_table).stripe(true)),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .px(px(12.))
+                            .py(px(4.))
+                            .bg(rgb(BG_HEADER))
+                            .text_color(rgb(TEXT_DIM))
+                            .child(format!(
+                                "{total} Total  |  {running} Running  |  {stopped} Stopped"
+                            )),
+                    )
+                    .into_any_element()
+            }
+            3 => div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .overflow_hidden()
+                .child(
+                    div()
+                        .flex_1()
+                        .overflow_hidden()
+                        .child(Table::new(&self.startup_table).stripe(true)),
+                )
+                .into_any_element(),
+            4 => {
+                let (total, tcp, udp, est, listen) = {
+                    let d = self.conn_table.read(cx).delegate();
+                    (d.total, d.tcp, d.udp, d.established, d.listening)
+                };
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .flex_1()
+                            .overflow_hidden()
+                            .child(Table::new(&self.conn_table).stripe(true)),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .px(px(12.))
+                            .py(px(4.))
+                            .bg(rgb(BG_HEADER))
+                            .text_color(rgb(TEXT_DIM))
+                            .child(format!(
+                                "{total} Total  |  {tcp} TCP  |  {udp} UDP  |  {est} EST  |  {listen} LISTEN"
+                            )),
+                    )
+                    .into_any_element()
+            }
+            _ => self.render_information(cx),
         };
 
         div()

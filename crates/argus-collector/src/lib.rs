@@ -14,14 +14,21 @@ mod icon;
 mod net;
 mod nt;
 mod perf;
+mod services;
+mod startup;
+mod sysinfo;
 mod windows_q;
 
 pub use disk::DiskStats;
 pub use enrich::{Enriched, Enricher};
 pub use etw::{EtwMonitor, IoTotals};
 pub use gpu::GpuAdapterPerf;
+pub use net::{ConnQuery, ConnRow};
 pub use nt::RawProcess;
 pub use perf::{CoreLoad, MemDetail, NetAdapterStats, PerfInfo};
+pub use services::{query_services, ServiceInfo};
+pub use startup::{query_startup_apps, StartupApp};
+pub use sysinfo::{query_system_information, Section, SystemInformation};
 
 use std::sync::Arc;
 
