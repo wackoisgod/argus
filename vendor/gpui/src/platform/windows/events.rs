@@ -243,6 +243,7 @@ impl WindowsWindowInner {
     }
 
     fn handle_size_move_loop(&self, handle: HWND) -> Option<isize> {
+        self.in_size_move.set(true);
         unsafe {
             let ret = SetTimer(
                 Some(handle),
@@ -261,9 +262,13 @@ impl WindowsWindowInner {
     }
 
     fn handle_size_move_loop_exit(&self, handle: HWND) -> Option<isize> {
+        self.in_size_move.set(false);
         unsafe {
             KillTimer(Some(handle), SIZE_MOVE_LOOP_TIMER_ID).log_err();
         }
+        // TaskManager patch: settle with a full-quality frame at the final
+        // size after throttled drag painting.
+        self.draw_window(handle, true);
         None
     }
 
@@ -272,6 +277,8 @@ impl WindowsWindowInner {
             for runnable in self.main_receiver.drain() {
                 runnable.run();
             }
+            // TaskManager patch: throttling happens in handle_paint_msg,
+            // which knows we're inside the size/move loop.
             self.handle_paint_msg(handle)
         } else {
             None
@@ -279,6 +286,20 @@ impl WindowsWindowInner {
     }
 
     fn handle_paint_msg(&self, handle: HWND) -> Option<isize> {
+        // TaskManager patch: while the user is interactively resizing,
+        // cap paints at ~30fps — DirectComposition stretches the last
+        // frame in between, which reads far smoother than a struggling
+        // full-rate relayout.
+        if self.in_size_move.get() {
+            let recently_drawn = self
+                .last_draw
+                .get()
+                .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(33));
+            if recently_drawn {
+                unsafe { ValidateRect(Some(handle), None).ok().log_err() };
+                return Some(0);
+            }
+        }
         self.draw_window(handle, false)
     }
 
@@ -1229,6 +1250,9 @@ impl WindowsWindowInner {
             force_render,
         });
         self.state.borrow_mut().callbacks.request_frame = Some(request_frame);
+        // TaskManager patch: stamp completed draws so the size/move loop's
+        // timer repaints can be throttled.
+        self.last_draw.set(Some(std::time::Instant::now()));
         unsafe { ValidateRect(Some(handle), None).ok().log_err() };
         Some(0)
     }

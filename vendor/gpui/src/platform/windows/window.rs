@@ -64,6 +64,13 @@ pub(crate) struct WindowsWindowInner {
     hwnd: HWND,
     pub(super) this: Weak<Self>,
     drop_target_helper: IDropTargetHelper,
+    /// TaskManager patch: last completed draw, used to throttle the modal
+    /// size/move loop's 10ms-timer repaints — full relayout at ~100Hz is
+    /// what makes interactive resize jittery.
+    pub(crate) last_draw: std::cell::Cell<Option<std::time::Instant>>,
+    /// TaskManager patch: inside the modal size/move loop (between
+    /// WM_ENTERSIZEMOVE and WM_EXITSIZEMOVE).
+    pub(crate) in_size_move: std::cell::Cell<bool>,
     pub(crate) state: RefCell<WindowsWindowState>,
     pub(crate) system_settings: RefCell<WindowsSystemSettings>,
     pub(crate) handle: AnyWindowHandle,
@@ -222,6 +229,8 @@ impl WindowsWindowInner {
             hwnd,
             this: this.clone(),
             drop_target_helper: context.drop_target_helper.clone(),
+            last_draw: std::cell::Cell::new(None),
+            in_size_move: std::cell::Cell::new(false),
             state,
             handle: context.handle,
             hide_title_bar: context.hide_title_bar,

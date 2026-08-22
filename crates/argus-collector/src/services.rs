@@ -104,6 +104,15 @@ pub fn query_services() -> Vec<ServiceInfo> {
         let entries =
             std::slice::from_raw_parts(buf.as_ptr() as *const ENUM_SERVICE_STATUS_PROCESSW, count as usize);
         out.reserve(entries.len());
+        // Startup type / account / path change rarely; one OpenService +
+        // QueryServiceConfig per service dominates the sweep, so cache the
+        // config per service name for the process lifetime. Status and pid
+        // come from the (single-call) enumeration and stay fresh.
+        static CONFIG_CACHE: std::sync::Mutex<
+            Option<rustc_hash::FxHashMap<Arc<str>, (u32, Arc<str>, Arc<str>)>>,
+        > = std::sync::Mutex::new(None);
+        let mut cache_guard = CONFIG_CACHE.lock().unwrap();
+        let cache = cache_guard.get_or_insert_with(Default::default);
         let mut cfg_buf = vec![0u8; 8192];
         for e in entries {
             let mut info = ServiceInfo {
@@ -113,22 +122,32 @@ pub fn query_services() -> Vec<ServiceInfo> {
                 pid: e.ServiceStatusProcess.dwProcessId,
                 ..Default::default()
             };
-            let svc = OpenServiceW(scm, e.lpServiceName, SERVICE_QUERY_CONFIG);
-            if !svc.is_null() {
-                let mut cfg_needed = 0u32;
-                if QueryServiceConfigW(
-                    svc,
-                    cfg_buf.as_mut_ptr() as *mut QUERY_SERVICE_CONFIGW,
-                    cfg_buf.len() as u32,
-                    &mut cfg_needed,
-                ) != 0
-                {
-                    let cfg = &*(cfg_buf.as_ptr() as *const QUERY_SERVICE_CONFIGW);
-                    info.startup = cfg.dwStartType;
-                    info.user = wide_to_arc(cfg.lpServiceStartName);
-                    info.path = wide_to_arc(cfg.lpBinaryPathName);
+            if let Some((startup, user, path)) = cache.get(&info.name) {
+                info.startup = *startup;
+                info.user = user.clone();
+                info.path = path.clone();
+            } else {
+                let svc = OpenServiceW(scm, e.lpServiceName, SERVICE_QUERY_CONFIG);
+                if !svc.is_null() {
+                    let mut cfg_needed = 0u32;
+                    if QueryServiceConfigW(
+                        svc,
+                        cfg_buf.as_mut_ptr() as *mut QUERY_SERVICE_CONFIGW,
+                        cfg_buf.len() as u32,
+                        &mut cfg_needed,
+                    ) != 0
+                    {
+                        let cfg = &*(cfg_buf.as_ptr() as *const QUERY_SERVICE_CONFIGW);
+                        info.startup = cfg.dwStartType;
+                        info.user = wide_to_arc(cfg.lpServiceStartName);
+                        info.path = wide_to_arc(cfg.lpBinaryPathName);
+                        cache.insert(
+                            info.name.clone(),
+                            (info.startup, info.user.clone(), info.path.clone()),
+                        );
+                    }
+                    CloseServiceHandle(svc);
                 }
-                CloseServiceHandle(svc);
             }
             out.push(info);
         }

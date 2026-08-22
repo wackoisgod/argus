@@ -1090,13 +1090,14 @@ impl TableDelegate for ProcessTableDelegate {
                     .into_any_element()
             }
             Row::Proc { row, child, group } => {
-                let (row, is_child, group) = (row.clone(), *child, group.clone());
+                // Hot path: one cell per call, so clone only the field this
+                // column needs — cloning the whole ProcRow (~50 refcounted
+                // strings) per cell dominated resize/redraw profiles.
                 match self.columns[col_ix].key.as_ref() {
                     "name" => {
-                        let icon = row
-                            .icon
-                            .as_ref()
-                            .map(|bytes| self.icon_image(bytes));
+                        let (icon_bytes, name, is_child, group) =
+                            (row.icon.clone(), row.name.clone(), *child, group.clone());
+                        let icon = icon_bytes.as_ref().map(|bytes| self.icon_image(bytes));
                         let content = div()
                             .flex()
                             .items_center()
@@ -1132,7 +1133,7 @@ impl TableDelegate for ProcessTableDelegate {
                                     .into_any_element(),
                                 None => div().w(px(16.)).flex_none().into_any_element(),
                             })
-                            .child(row.name.clone());
+                            .child(name);
                         td_cell(content, false)
                     }
                     // Numeric cells right-align to match their headers.

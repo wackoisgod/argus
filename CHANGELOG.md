@@ -7,6 +7,14 @@ All notable changes to Argus are documented here. The format follows
 ## [Unreleased]
 
 ### Performance
+- Interactive window resizing is far smoother: paints during the modal
+  size/move loop are capped at ~30fps (the drag timer was forcing full
+  relayouts at ~100Hz), with a full-quality frame on release; the process
+  table also stopped cloning a whole row per rendered cell.
+- Services tab: per-service config (startup type, account, path) is cached
+  after first read — the 3s status refresh now costs one enumeration call
+  instead of ~300 config queries (tab idle cost 7.4% → 4.2% of one core,
+  in line with the other tabs).
 - Adapter-wide GPU probing (engines, VRAM, temperature) relaxes to every
   other tick while the Performance tab isn't visible — each D3DKMT query can
   stall inside the display driver. Per-process GPU attribution still samples
