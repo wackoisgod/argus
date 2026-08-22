@@ -1477,8 +1477,11 @@ fn spawn_sampler() -> futures::channel::mpsc::Receiver<Snapshot> {
                 let still_minimized = minimized && window_minimized(&mut hwnd);
                 // On the transition into the tray, hand the working set back
                 // to the OS — Task Manager does the same. Pages fault back
-                // in lazily on restore.
-                if still_minimized && !was_minimized {
+                // in lazily on restore. Also trim once shortly after launch:
+                // startup-only pages (icon decoding, font enumeration, init
+                // code) otherwise sit in the working set forever.
+                let post_startup_trim = tick == 8;
+                if (still_minimized && !was_minimized) || post_startup_trim {
                     use windows_sys::Win32::System::ProcessStatus::K32EmptyWorkingSet;
                     use windows_sys::Win32::System::Threading::GetCurrentProcess;
                     unsafe { K32EmptyWorkingSet(GetCurrentProcess()) };

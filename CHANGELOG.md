@@ -13,6 +13,11 @@ All notable changes to Argus are documented here. The format follows
   of bleeding into the next one.
 
 ### Performance
+- Memory: the swapchain uses the flip-model minimum of two buffers (the
+  third was ~8MB of pure overhead at typical window sizes — real RAM on
+  UMA iGPUs), and the working set is trimmed once after the startup burst
+  so init-only pages don't linger. Private working set at idle: ~50MB →
+  ~30MB, on par with TaskSlinger.
 - Interactive window resizing is far smoother: paints during the modal
   size/move loop are capped at ~30fps (the drag timer was forcing full
   relayouts at ~100Hz), with a full-quality frame on release; the process

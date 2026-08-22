@@ -1401,7 +1401,11 @@ fn report_live_objects(device: &ID3D11Device) -> Result<()> {
     Ok(())
 }
 
-const BUFFER_COUNT: usize = 3;
+// TaskManager patch: flip-model minimum. The third buffer only helps
+// sustained high-FPS pipelining; at our vsync-paced ≤66Hz it is a full
+// window-sized allocation (~8MB at 1420x1460) of pure overhead — real
+// system RAM on UMA iGPUs.
+const BUFFER_COUNT: usize = 2;
 
 pub(crate) mod shader_resources {
     use anyhow::Result;
